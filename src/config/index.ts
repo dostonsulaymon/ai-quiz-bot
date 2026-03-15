@@ -20,6 +20,8 @@ type Config = {
   NODE_ENV: NodeEnv;
   MAX_QUESTIONS_PER_TEST: number;
   MAX_FILE_SIZE_MB: number;
+  RATE_LIMIT_GENERATIONS_PER_HOUR: number;
+  RATE_LIMIT_DAILY_MAX: number;
 };
 
 const PROVIDERS = ["claude", "gemini", "ollama"] as const;
@@ -79,5 +81,7 @@ export const config: Config = {
   OLLAMA_MODEL: getEnv("OLLAMA_MODEL", false),
   NODE_ENV: nodeEnv,
   MAX_QUESTIONS_PER_TEST: parseNumber("MAX_QUESTIONS_PER_TEST"),
-  MAX_FILE_SIZE_MB: parseNumber("MAX_FILE_SIZE_MB")
+  MAX_FILE_SIZE_MB: parseNumber("MAX_FILE_SIZE_MB"),
+  RATE_LIMIT_GENERATIONS_PER_HOUR: parseNumber("RATE_LIMIT_GENERATIONS_PER_HOUR"),
+  RATE_LIMIT_DAILY_MAX: parseNumber("RATE_LIMIT_DAILY_MAX")
 };

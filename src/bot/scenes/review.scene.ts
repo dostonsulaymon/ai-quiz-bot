@@ -2,11 +2,14 @@ import { Conversation } from "@grammyjs/conversations";
 import { InlineKeyboard } from "grammy";
 import { getAIProvider } from "../../ai/ai.factory.js";
 import { TestRepository } from "../../db/repositories/test.repository.js";
+import { UserRepository } from "../../db/repositories/user.repository.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { logger } from "../../shared/logger.js";
+import { ValidationError } from "../../shared/errors/ValidationError.js";
 import type { GenerateQuestionsInput, Question, QuestionType, TestSourceType } from "../../shared/types/index.js";
 import type { BotContext, UploadedFile } from "../types.js";
 import { resetSession } from "../types.js";
-import { TEST_CONVERSATION_NAME } from "./test.scene.js";
+import { assertGenerationRateLimit } from "../middlewares/rateLimitMiddleware.js";
 
 export const REVIEW_CONVERSATION_NAME = "review";
 
@@ -17,8 +20,10 @@ const REVIEW_REGENERATE_CALLBACK = "review:regenerate";
 const REVIEW_DELETE_CALLBACK = "review:delete";
 const REVIEW_START_CALLBACK = "review:start";
 const REVIEW_REGENERATE_ALL_CALLBACK = "review:regenerate-all";
+const CANCELLED = Symbol("review-cancelled");
 
 const testRepository = new TestRepository();
+const userRepository = new UserRepository();
 
 const isCancelMessage = (ctx: BotContext): boolean => ctx.msg?.text?.trim() === "/cancel";
 
@@ -30,7 +35,7 @@ const buildGenerateInput = (
   const firstFile = uploadedFiles[0];
 
   if (!firstFile) {
-    throw new AppError("No uploaded files are available for generation", 400);
+    throw new ValidationError("No uploaded files are available for generation", "UPLOAD_MISSING");
   }
 
   if (firstFile.type === "pdf") {
@@ -47,7 +52,10 @@ const buildGenerateInput = (
   return {
     content: {
       type: "images",
-      base64Array: uploadedFiles.map((file) => file.base64 ?? "")
+      images: uploadedFiles.map((file) => ({
+        base64: file.base64 ?? "",
+        mimeType: file.mimeType ?? "image/jpeg"
+      }))
     },
     questionCount,
     questionTypes
@@ -120,19 +128,23 @@ const updateEmptyMessage = async (ctx: BotContext, messageId: number): Promise<v
 const getSourceType = (uploadedFiles: UploadedFile[]): TestSourceType => {
   const firstFile = uploadedFiles[0];
   if (!firstFile) {
-    throw new AppError("Missing uploaded files for this review session", 400);
+    throw new ValidationError("Missing uploaded files for this review session", "UPLOAD_MISSING");
   }
 
   return firstFile.type === "pdf" ? "pdf" : "images";
 };
 
-const waitForReviewUpdate = async (conversation: Conversation<BotContext, BotContext>): Promise<BotContext> => {
+const waitForReviewUpdate = async (
+  conversation: Conversation<BotContext, BotContext>
+): Promise<BotContext | typeof CANCELLED> => {
   const ctx = await conversation.wait();
 
   if (isCancelMessage(ctx)) {
-    resetSession(ctx.session);
+    // Session writes inside a conversation must go through external() so they
+    // are skipped on replay instead of being re-applied and corrupting state.
+    await conversation.external((liveCtx) => { resetSession(liveCtx.session); });
     await ctx.reply("Your current flow has been cancelled and your session is back to idle.");
-    throw new Error("conversation_cancelled");
+    return CANCELLED;
   }
 
   return ctx;
@@ -140,10 +152,13 @@ const waitForReviewUpdate = async (conversation: Conversation<BotContext, BotCon
 
 const generateSingleQuestion = async (
   conversation: Conversation<BotContext, BotContext>,
+  ctx: BotContext,
   uploadedFiles: UploadedFile[],
   question: Question
 ): Promise<Question> => {
   const input = buildGenerateInput(uploadedFiles, 1, [question.type]);
+  // Rule 3: Redis-backed rate limiting must run outside replay.
+  await conversation.external((ctx) => assertGenerationRateLimit(ctx));
   const generated = await conversation.external(async () => getAIProvider().generateQuestions(input));
   const nextQuestion = generated[0];
 
@@ -155,15 +170,20 @@ const generateSingleQuestion = async (
 };
 
 const regenerateAllQuestions = async (conversation: Conversation<BotContext, BotContext>, ctx: BotContext): Promise<Question[]> => {
-  const uploadedFiles = ctx.session.uploadedFiles ?? [];
-  const questionCount = ctx.session.questionCount;
-  const questionTypes = ctx.session.questionTypes;
+  const { uploadedFiles, questionCount, questionTypes } = await conversation.external((ctx) => ({
+    // Rule 1: session reads in conversations must go through external.
+    uploadedFiles: ctx.session.uploadedFiles ?? [],
+    questionCount: ctx.session.questionCount,
+    questionTypes: ctx.session.questionTypes
+  }));
 
   if (!questionCount || !questionTypes?.length || uploadedFiles.length === 0) {
-    throw new AppError("Missing data required to regenerate questions", 400);
+    throw new ValidationError("Missing data required to regenerate questions", "UPLOAD_SESSION_INCOMPLETE");
   }
 
   const input = buildGenerateInput(uploadedFiles, questionCount, questionTypes);
+  // Rule 3: Redis-backed rate limiting must run outside replay.
+  await conversation.external((ctx) => assertGenerationRateLimit(ctx));
   return conversation.external(async () => getAIProvider().generateQuestions(input));
 };
 
@@ -171,7 +191,7 @@ const promptForEditedAnswer = async (
   conversation: Conversation<BotContext, BotContext>,
   ctx: BotContext,
   question: Question
-): Promise<string> => {
+): Promise<string | typeof CANCELLED> => {
   const hint =
     question.type === "mcq"
       ? "Type the new correct answer (A, B, C, or D)."
@@ -183,6 +203,9 @@ const promptForEditedAnswer = async (
 
   while (true) {
     const nextCtx = await waitForReviewUpdate(conversation);
+    if (nextCtx === CANCELLED) {
+      return CANCELLED;
+    }
     const rawAnswer = nextCtx.msg?.text?.trim();
 
     if (!rawAnswer) {
@@ -215,55 +238,81 @@ const promptForEditedAnswer = async (
 };
 
 const saveTestAndTransition = async (conversation: Conversation<BotContext, BotContext>, ctx: BotContext): Promise<void> => {
-  const draftQuestions = ctx.session.draftQuestions ?? [];
-  const uploadedFiles = ctx.session.uploadedFiles ?? [];
-
-  if (!ctx.user) {
-    throw new AppError("User record is missing from context", 500);
-  }
+  const { draftQuestions, uploadedFiles } = await conversation.external((ctx) => ({
+    // Rule 1: session reads in conversations must go through external.
+    draftQuestions: ctx.session.draftQuestions ?? [],
+    uploadedFiles: ctx.session.uploadedFiles ?? []
+  }));
 
   if (draftQuestions.length < 1) {
     throw new AppError("You need at least one question before starting a test.", 400);
   }
 
+  const user = await conversation.external(async () => {
+    if (!ctx.from?.id) {
+      throw new AppError("User record is missing from context", 500);
+    }
+
+    return userRepository.findOrCreate(ctx.from.id);
+  });
+
   const savedTest = await conversation.external(async () =>
     testRepository.create({
-      creatorId: ctx.user!._id,
+      creatorId: user._id,
       questions: draftQuestions,
       sourceType: getSourceType(uploadedFiles),
       questionCount: draftQuestions.length
     })
   );
 
-  ctx.session.activeTestId = String(savedTest._id);
-  ctx.session.currentQuestionIndex = 0;
-  ctx.session.state = "testing";
-
-  await ctx.conversation.enter(TEST_CONVERSATION_NAME);
+  await conversation.external((ctx) => {
+    // Rule 1: transition state must be persisted outside replay.
+    ctx.session.activeTestId = String(savedTest._id);
+    ctx.session.currentQuestionIndex = 0;
+    ctx.session.state = "testing";
+  });
 };
 
 export const reviewScene = async (conversation: Conversation<BotContext, BotContext>, ctx: BotContext): Promise<void> => {
-  try {
+  await conversation.external((ctx) => {
+    // Rule 1: session writes in conversations must go through external.
     ctx.session.state = "reviewing";
     ctx.session.reviewIndex = ctx.session.reviewIndex ?? 0;
+  });
 
-    const initialQuestions = ctx.session.draftQuestions ?? [];
-    if (initialQuestions.length === 0) {
-      await ctx.reply("There are no draft questions to review.");
-      return;
-    }
+  const initialState = await conversation.external((ctx) => ({
+    draftQuestions: ctx.session.draftQuestions ?? [],
+    reviewIndex: ctx.session.reviewIndex ?? 0
+  }));
 
-    let messageId = (
-      await ctx.reply(
-        formatQuestionCard(initialQuestions[ctx.session.reviewIndex]!, ctx.session.reviewIndex, initialQuestions.length),
-        {
-          reply_markup: buildReviewKeyboard(ctx.session.reviewIndex, initialQuestions.length)
-        }
-      )
-    ).message_id;
+  if (initialState.draftQuestions.length === 0) {
+    await ctx.reply("There are no draft questions to review.");
+    return;
+  }
+  logger.info("Review scene entered", {
+    event: "review.scene.enter",
+    userId: ctx.from?.id,
+    totalQuestions: initialState.draftQuestions.length
+  });
 
-    while (true) {
+  let messageId = (
+    await ctx.reply(
+      formatQuestionCard(
+        initialState.draftQuestions[initialState.reviewIndex]!,
+        initialState.reviewIndex,
+        initialState.draftQuestions.length
+      ),
+      {
+        reply_markup: buildReviewKeyboard(initialState.reviewIndex, initialState.draftQuestions.length)
+      }
+    )
+  ).message_id;
+
+  while (true) {
       const nextCtx = await waitForReviewUpdate(conversation);
+      if (nextCtx === CANCELLED) {
+        return;
+      }
       const data = nextCtx.callbackQuery?.data;
 
       if (!data) {
@@ -276,7 +325,12 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
         continue;
       }
 
-      const draftQuestions = ctx.session.draftQuestions ?? [];
+      const { draftQuestions, reviewIndex, uploadedFiles } = await conversation.external((ctx) => ({
+        // Rule 1: session reads in conversations must go through external.
+        draftQuestions: ctx.session.draftQuestions ?? [],
+        reviewIndex: ctx.session.reviewIndex ?? 0,
+        uploadedFiles: ctx.session.uploadedFiles ?? []
+      }));
       if (draftQuestions.length === 0) {
         if (data !== REVIEW_REGENERATE_ALL_CALLBACK) {
           await nextCtx.answerCallbackQuery({ text: "No questions remain. Regenerate all to continue.", show_alert: false });
@@ -287,13 +341,22 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
       switch (data) {
         case REVIEW_PREV_CALLBACK: {
           await nextCtx.answerCallbackQuery();
+          logger.info("Review question kept", {
+            event: "review.question.kept",
+            userId: nextCtx.from?.id,
+            questionIndex: reviewIndex
+          });
           if (draftQuestions.length > 0) {
-            ctx.session.reviewIndex = ctx.session.reviewIndex === 0 ? draftQuestions.length - 1 : ctx.session.reviewIndex! - 1;
+            const nextIndex = reviewIndex === 0 ? draftQuestions.length - 1 : reviewIndex - 1;
+            await conversation.external((ctx) => {
+              // Rule 1: session writes in conversations must go through external.
+              ctx.session.reviewIndex = nextIndex;
+            });
             await updateReviewMessage(
               nextCtx,
               messageId,
-              draftQuestions[ctx.session.reviewIndex]!,
-              ctx.session.reviewIndex,
+              draftQuestions[nextIndex]!,
+              nextIndex,
               draftQuestions.length
             );
           }
@@ -301,13 +364,22 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
         }
         case REVIEW_NEXT_CALLBACK: {
           await nextCtx.answerCallbackQuery();
+          logger.info("Review question kept", {
+            event: "review.question.kept",
+            userId: nextCtx.from?.id,
+            questionIndex: reviewIndex
+          });
           if (draftQuestions.length > 0) {
-            ctx.session.reviewIndex = (ctx.session.reviewIndex! + 1) % draftQuestions.length;
+            const nextIndex = (reviewIndex + 1) % draftQuestions.length;
+            await conversation.external((ctx) => {
+              // Rule 1: session writes in conversations must go through external.
+              ctx.session.reviewIndex = nextIndex;
+            });
             await updateReviewMessage(
               nextCtx,
               messageId,
-              draftQuestions[ctx.session.reviewIndex]!,
-              ctx.session.reviewIndex,
+              draftQuestions[nextIndex]!,
+              nextIndex,
               draftQuestions.length
             );
           }
@@ -315,35 +387,70 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
         }
         case REVIEW_EDIT_CALLBACK: {
           await nextCtx.answerCallbackQuery();
-          const currentQuestion = draftQuestions[ctx.session.reviewIndex ?? 0];
+          const currentQuestion = draftQuestions[reviewIndex];
           if (!currentQuestion) {
             await nextCtx.reply("There is no question to edit right now.");
             break;
           }
 
           const newAnswer = await promptForEditedAnswer(conversation, nextCtx, currentQuestion);
+          if (newAnswer === CANCELLED) {
+            return;
+          }
           currentQuestion.correctAnswer = newAnswer;
-          await updateReviewMessage(nextCtx, messageId, currentQuestion, ctx.session.reviewIndex ?? 0, draftQuestions.length);
+          logger.info("Review question edited", {
+            event: "review.question.edited",
+            userId: nextCtx.from?.id,
+            questionIndex: reviewIndex
+          });
+          await conversation.external((ctx) => {
+            // Rule 1: session writes in conversations must go through external.
+            ctx.session.draftQuestions = draftQuestions;
+          });
+          await updateReviewMessage(nextCtx, messageId, currentQuestion, reviewIndex, draftQuestions.length);
           break;
         }
         case REVIEW_REGENERATE_CALLBACK: {
-          const currentIndex = ctx.session.reviewIndex ?? 0;
+          const currentIndex = reviewIndex;
           const currentQuestion = draftQuestions[currentIndex];
           if (!currentQuestion) {
             await nextCtx.answerCallbackQuery({ text: "There is no question to regenerate.", show_alert: false });
             break;
           }
 
+          logger.info("Review question regeneration started", {
+            event: "review.question.regenerate.start",
+            userId: nextCtx.from?.id,
+            questionIndex: currentIndex
+          });
           await nextCtx.api.editMessageText(nextCtx.chatId!, messageId, "Regenerating... 🔄");
 
           try {
-            const replacement = await generateSingleQuestion(conversation, ctx.session.uploadedFiles ?? [], currentQuestion);
+            const replacement = await generateSingleQuestion(
+              conversation,
+              nextCtx,
+              uploadedFiles,
+              currentQuestion
+            );
             draftQuestions[currentIndex] = replacement;
-            ctx.session.draftQuestions = draftQuestions;
+            await conversation.external((ctx) => {
+              // Rule 1: session writes in conversations must go through external.
+              ctx.session.draftQuestions = draftQuestions;
+            });
+            logger.info("Review question regeneration succeeded", {
+              event: "review.question.regenerate.success",
+              userId: nextCtx.from?.id,
+              questionIndex: currentIndex
+            });
             await updateReviewMessage(nextCtx, messageId, replacement, currentIndex, draftQuestions.length);
             await nextCtx.answerCallbackQuery();
           } catch (error) {
             console.error("[review] Failed to regenerate question", error);
+            logger.error("Review question regeneration failed", {
+              event: "review.question.regenerate.failed",
+              userId: nextCtx.from?.id,
+              questionIndex: currentIndex
+            });
             await updateReviewMessage(nextCtx, messageId, currentQuestion, currentIndex, draftQuestions.length);
             await nextCtx.answerCallbackQuery({ text: "Regeneration failed. Keeping the original question.", show_alert: false });
           }
@@ -351,21 +458,37 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
         }
         case REVIEW_DELETE_CALLBACK: {
           await nextCtx.answerCallbackQuery();
-          draftQuestions.splice(ctx.session.reviewIndex ?? 0, 1);
-          ctx.session.draftQuestions = draftQuestions;
+          draftQuestions.splice(reviewIndex, 1);
+          await conversation.external((ctx) => {
+            // Rule 1: session writes in conversations must go through external.
+            ctx.session.draftQuestions = draftQuestions;
+          });
+          logger.info("Review question deleted", {
+            event: "review.question.deleted",
+            userId: nextCtx.from?.id,
+            questionIndex: reviewIndex,
+            remaining: draftQuestions.length
+          });
 
           if (draftQuestions.length === 0) {
-            ctx.session.reviewIndex = 0;
+            await conversation.external((ctx) => {
+              // Rule 1: session writes in conversations must go through external.
+              ctx.session.reviewIndex = 0;
+            });
             await updateEmptyMessage(nextCtx, messageId);
             break;
           }
 
-          ctx.session.reviewIndex = Math.min(ctx.session.reviewIndex ?? 0, draftQuestions.length - 1);
+          const nextIndex = Math.min(reviewIndex, draftQuestions.length - 1);
+          await conversation.external((ctx) => {
+            // Rule 1: session writes in conversations must go through external.
+            ctx.session.reviewIndex = nextIndex;
+          });
           await updateReviewMessage(
             nextCtx,
             messageId,
-            draftQuestions[ctx.session.reviewIndex]!,
-            ctx.session.reviewIndex,
+            draftQuestions[nextIndex]!,
+            nextIndex,
             draftQuestions.length
           );
           break;
@@ -376,8 +499,16 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
 
           try {
             const regenerated = await regenerateAllQuestions(conversation, ctx);
-            ctx.session.draftQuestions = regenerated;
-            ctx.session.reviewIndex = 0;
+            if (regenerated.length === 0) {
+              // AI returned an empty array — treat as a failure so the user can retry.
+              throw new Error("AI returned an empty question list");
+            }
+
+            await conversation.external((ctx) => {
+              // Rule 1: session writes in conversations must go through external.
+              ctx.session.draftQuestions = regenerated;
+              ctx.session.reviewIndex = 0;
+            });
             await updateReviewMessage(nextCtx, messageId, regenerated[0]!, 0, regenerated.length);
           } catch (error) {
             console.error("[review] Failed to regenerate all questions", error);
@@ -393,6 +524,11 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
           }
 
           await nextCtx.answerCallbackQuery();
+          logger.info("Review scene confirmed", {
+            event: "review.scene.confirmed",
+            userId: nextCtx.from?.id,
+            finalQuestionCount: draftQuestions.length
+          });
           await saveTestAndTransition(conversation, nextCtx);
           return;
         }
@@ -402,11 +538,4 @@ export const reviewScene = async (conversation: Conversation<BotContext, BotCont
         }
       }
     }
-  } catch (error) {
-    if (error instanceof Error && error.message === "conversation_cancelled") {
-      return;
-    }
-
-    throw error;
-  }
 };

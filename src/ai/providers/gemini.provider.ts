@@ -1,6 +1,7 @@
 import type { IAIProvider } from "../ai.interface.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { logger } from "../../shared/logger.js";
 import type { GenerateQuestionsInput, Question } from "../../shared/types/index.js";
 import { createQuestionPrompt, parseQuestionsResponse } from "./base.provider.js";
 
@@ -19,6 +20,14 @@ type GeminiResponse = {
 
 export class GeminiProvider implements IAIProvider {
   async generateQuestions(input: GenerateQuestionsInput): Promise<Question[]> {
+    const startedAt = Date.now();
+    logger.info("Gemini request started", {
+      event: "ai.provider.request",
+      provider: "gemini",
+      model: config.GEMINI_MODEL,
+      questionCount: input.questionCount,
+      contentType: input.content.type
+    });
     const url = new URL(
       `https://generativelanguage.googleapis.com/v1beta/models/${config.GEMINI_MODEL!}:generateContent`
     );
@@ -60,7 +69,24 @@ export class GeminiProvider implements IAIProvider {
       throw new AppError("Gemini response did not include text content", 502, payload);
     }
 
-    return parseQuestionsResponse(text);
+    logger.info("Gemini response received", {
+      event: "ai.provider.response",
+      provider: "gemini",
+      model: config.GEMINI_MODEL,
+      durationMs: Date.now() - startedAt,
+      rawLength: text.length
+    });
+
+    try {
+      return parseQuestionsResponse(text);
+    } catch (error) {
+      logger.error("Gemini parse failed", {
+        event: "ai.provider.parse.failed",
+        provider: "gemini",
+        raw: text.slice(0, 200)
+      });
+      throw error;
+    }
   }
 
   private buildParts(input: GenerateQuestionsInput): Array<Record<string, unknown>> {
@@ -83,10 +109,11 @@ export class GeminiProvider implements IAIProvider {
       ];
     }
 
-    return input.content.base64Array.map((image) => ({
+    return input.content.images.map((image) => ({
       inline_data: {
-        mime_type: "image/png",
-        data: image
+        // Use the actual MIME type recorded at upload time instead of a hard-coded "image/png".
+        mime_type: image.mimeType,
+        data: image.base64
       }
     }));
   }

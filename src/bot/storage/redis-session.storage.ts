@@ -1,12 +1,14 @@
 import type { StorageAdapter } from "grammy";
 import type { Redis } from "ioredis";
+import { logger } from "../../shared/logger.js";
 
 const SESSION_PREFIX = "quiz-bot:session";
 
 export class RedisSessionStorage<T> implements StorageAdapter<T> {
   constructor(
     private readonly redis: Redis,
-    private readonly ttlSeconds?: number
+    private readonly ttlSeconds?: number,
+    private readonly onCorrupt?: () => T
   ) {}
 
   async read(key: string): Promise<T | undefined> {
@@ -15,7 +17,16 @@ export class RedisSessionStorage<T> implements StorageAdapter<T> {
       return undefined;
     }
 
-    return JSON.parse(raw) as T;
+    try {
+      return JSON.parse(raw) as T;
+    } catch (error) {
+      logger.warn("Session parse failed, resetting session", {
+        sessionKey: key,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      await this.delete(key);
+      return this.onCorrupt?.();
+    }
   }
 
   async write(key: string, value: T): Promise<void> {

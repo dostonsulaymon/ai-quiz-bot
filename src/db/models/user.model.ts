@@ -1,4 +1,4 @@
-import { model, models, Schema, type InferSchemaType, type HydratedDocument, type Model } from "mongoose";
+import mongoose, { model, Schema, type InferSchemaType, type HydratedDocument, type Model } from "mongoose";
 import { DEFAULT_QUESTION_TYPES } from "../../shared/types/index.js";
 
 const userSchema = new Schema(
@@ -40,4 +40,4 @@ export type User = InferSchemaType<typeof userSchema>;
 export type UserDocument = HydratedDocument<User>;
 type UserModel = Model<User>;
 
-export const UserModel = (models.User as UserModel | undefined) ?? model<User>("User", userSchema);
+export const UserModel = (mongoose.models.User as UserModel | undefined) ?? model<User>("User", userSchema);

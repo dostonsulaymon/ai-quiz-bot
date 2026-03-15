@@ -28,7 +28,8 @@ export type GenerateQuestionsInput =
   | {
       content: {
         type: "images";
-        base64Array: string[];
+        // Each entry carries its own MIME type so providers can send the correct media_type header.
+        images: Array<{ base64: string; mimeType: string }>;
       };
       questionCount: number;
       questionTypes: QuestionType[];

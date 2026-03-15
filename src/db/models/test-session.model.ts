@@ -1,4 +1,4 @@
-import { model, models, Schema, type HydratedDocument, type InferSchemaType, type Model, type Types } from "mongoose";
+import mongoose, { model, Schema, type HydratedDocument, type InferSchemaType, type Model, type Types } from "mongoose";
 
 const answerSchema = new Schema(
   {
@@ -25,12 +25,14 @@ const testSessionSchema = new Schema({
   testId: {
     type: Schema.Types.ObjectId,
     ref: "Test",
-    required: true
+    required: true,
+    index: true  // needed for countByTestId queries
   },
   userId: {
     type: Schema.Types.ObjectId,
     ref: "User",
-    required: true
+    required: true,
+    index: true  // needed for findByUser / countByUser queries
   },
   answers: {
     type: [answerSchema],
@@ -71,4 +73,4 @@ export type TestSessionDocument = HydratedDocument<TestSession>;
 type TestSessionModel = Model<TestSession>;
 
 export const TestSessionModel =
-  (models.TestSession as TestSessionModel | undefined) ?? model<TestSession>("TestSession", testSessionSchema);
+  (mongoose.models.TestSession as TestSessionModel | undefined) ?? model<TestSession>("TestSession", testSessionSchema);

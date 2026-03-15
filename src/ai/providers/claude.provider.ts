@@ -1,6 +1,7 @@
 import type { IAIProvider } from "../ai.interface.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { logger } from "../../shared/logger.js";
 import type { GenerateQuestionsInput, Question } from "../../shared/types/index.js";
 import { createQuestionPrompt, parseQuestionsResponse } from "./base.provider.js";
 
@@ -16,6 +17,14 @@ type ClaudeResponse = {
 
 export class ClaudeProvider implements IAIProvider {
   async generateQuestions(input: GenerateQuestionsInput): Promise<Question[]> {
+    const startedAt = Date.now();
+    logger.info("Claude request started", {
+      event: "ai.provider.request",
+      provider: "claude",
+      model: config.CLAUDE_MODEL,
+      questionCount: input.questionCount,
+      contentType: input.content.type
+    });
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -47,7 +56,24 @@ export class ClaudeProvider implements IAIProvider {
       throw new AppError("Claude response did not include text content", 502, payload);
     }
 
-    return parseQuestionsResponse(text);
+    logger.info("Claude response received", {
+      event: "ai.provider.response",
+      provider: "claude",
+      model: config.CLAUDE_MODEL,
+      durationMs: Date.now() - startedAt,
+      rawLength: text.length
+    });
+
+    try {
+      return parseQuestionsResponse(text);
+    } catch (error) {
+      logger.error("Claude parse failed", {
+        event: "ai.provider.parse.failed",
+        provider: "claude",
+        raw: text.slice(0, 200)
+      });
+      throw error;
+    }
   }
 
   private buildContentBlocks(input: GenerateQuestionsInput): Array<Record<string, unknown>> {
@@ -73,12 +99,13 @@ export class ClaudeProvider implements IAIProvider {
       ];
     }
 
-    return input.content.base64Array.map((image) => ({
+    return input.content.images.map((image) => ({
       type: "image",
       source: {
         type: "base64",
-        media_type: "image/png",
-        data: image
+        // Use the actual MIME type recorded at upload time instead of a hard-coded "image/png".
+        media_type: image.mimeType,
+        data: image.base64
       }
     }));
   }

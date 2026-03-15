@@ -62,6 +62,36 @@ export class TestSessionRepository {
   }
 
   async findByUser(userId: string | Types.ObjectId): Promise<TestSessionDocument[]> {
-    return TestSessionModel.find({ userId }).sort({ startedAt: -1 }).exec();
+    // Only return completed sessions so in-progress runs are not exposed.
+    return TestSessionModel.find({ userId, status: "completed" }).sort({ startedAt: -1 }).exec();
+  }
+
+  async findByUserPaginated(
+    userId: string | Types.ObjectId,
+    page: number,
+    pageSize: number
+  ): Promise<TestSessionDocument[]> {
+    const skip = Math.max(0, page - 1) * pageSize;
+
+    // Only return completed sessions so in-progress runs are not exposed.
+    return TestSessionModel.find({ userId, status: "completed" })
+      .sort({ startedAt: -1 })
+      .populate("testId")
+      .skip(skip)
+      .limit(pageSize)
+      .exec();
+  }
+
+  async countByUser(userId: string | Types.ObjectId): Promise<number> {
+    // Count only completed sessions to match what findByUserPaginated returns.
+    return TestSessionModel.countDocuments({ userId, status: "completed" }).exec();
+  }
+
+  async findByIdWithTest(id: string | Types.ObjectId): Promise<TestSessionDocument | null> {
+    return TestSessionModel.findById(id).populate("testId").exec();
+  }
+
+  async countByTestId(testId: string | Types.ObjectId): Promise<number> {
+    return TestSessionModel.countDocuments({ testId }).exec();
   }
 }

@@ -1,5 +1,7 @@
 import pdfParse from "pdf-parse";
-import { AppError } from "../../shared/errors/AppError.js";
+import { AIError } from "../../shared/errors/AIError.js";
+import { logger } from "../../shared/logger.js";
+import { ValidationError } from "../../shared/errors/ValidationError.js";
 import type { GenerateQuestionsInput, Question, QuestionType } from "../../shared/types/index.js";
 
 const questionSchemaDescription = `[
@@ -82,11 +84,16 @@ export const parseQuestionsResponse = (raw: string): Question[] => {
   try {
     parsed = JSON.parse(stripMarkdownFences(raw));
   } catch (error) {
-    throw new AppError("AI provider returned malformed JSON", 502, error);
+    logger.error("AI provider parse failed", {
+      event: "ai.provider.parse.failed",
+      provider: "unknown",
+      raw: raw.slice(0, 200)
+    });
+    throw new AIError("AI provider returned malformed JSON", error);
   }
 
   if (!Array.isArray(parsed) || !parsed.every(assertQuestion)) {
-    throw new AppError("AI provider returned an invalid question array", 502, parsed);
+    throw new AIError("AI provider returned an invalid question array", parsed);
   }
 
   return parsed;
@@ -103,5 +110,5 @@ export const extractTextFromInput = async (input: GenerateQuestionsInput): Promi
     return parsed.text.trim();
   }
 
-  throw new AppError("Image content is not supported by this provider", 400);
+  throw new ValidationError("Image content is not supported by this provider", "IMAGE_NOT_SUPPORTED");
 };

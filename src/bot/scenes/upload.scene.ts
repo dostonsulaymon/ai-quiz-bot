@@ -1,10 +1,12 @@
 import { Conversation } from "@grammyjs/conversations";
 import { InlineKeyboard } from "grammy";
 import { getAIProvider } from "../../ai/ai.factory.js";
+import { assertGenerationRateLimit } from "../middlewares/rateLimitMiddleware.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { logger } from "../../shared/logger.js";
+import { ValidationError } from "../../shared/errors/ValidationError.js";
 import { DEFAULT_QUESTION_TYPES, type GenerateQuestionsInput, type Question, type QuestionType } from "../../shared/types/index.js";
-import { REVIEW_CONVERSATION_NAME } from "./review.scene.js";
 import { resetSession, type BotContext, type UploadedFile } from "../types.js";
 
 export const UPLOAD_CONVERSATION_NAME = "upload";
@@ -30,6 +32,26 @@ const isCancelMessage = (ctx: BotContext): boolean => ctx.msg?.text?.trim() === 
 const isPhotoMessage = (ctx: BotContext): boolean => Boolean(ctx.msg?.photo?.length);
 
 const isDocumentMessage = (ctx: BotContext): boolean => Boolean(ctx.msg?.document);
+
+type ImageFileInfo = { fileId: string; fileSize: number | undefined; mimeType: string };
+
+/**
+ * Returns image file info from either a compressed photo message or a document
+ * sent via "Send as File". Returns null if the message is not an image.
+ * Telegram always recompresses ctx.message.photo to JPEG; documents carry the
+ * original mime_type set by Telegram's own detection.
+ */
+const extractImageFileInfo = (ctx: BotContext): ImageFileInfo | null => {
+  if (ctx.msg?.photo?.length) {
+    const photo = ctx.msg.photo.at(-1)!;
+    return { fileId: photo.file_id, fileSize: photo.file_size, mimeType: "image/jpeg" };
+  }
+  const doc = ctx.msg?.document;
+  if (doc?.mime_type?.startsWith("image/")) {
+    return { fileId: doc.file_id, fileSize: doc.file_size, mimeType: doc.mime_type };
+  }
+  return null;
+};
 
 const getFileSizeLimitBytes = (): number => (config.MAX_FILE_SIZE_MB ?? DEFAULT_MAX_FILE_SIZE_MB) * 1024 * 1024;
 
@@ -63,15 +85,33 @@ const buildDoneAddingImagesKeyboard = (): InlineKeyboard =>
 const buildRetryKeyboard = (): InlineKeyboard =>
   new InlineKeyboard().text("Retry generation", RETRY_GENERATION_CALLBACK);
 
-const getTelegramFileBuffer = async (ctx: BotContext, fileId: string): Promise<Buffer> => {
+const CANCELLED = Symbol("upload-cancelled");
+
+const getTelegramFile = async (ctx: BotContext, fileId: string) => {
   const file = await ctx.api.getFile(fileId);
   if (!file.file_path) {
-    throw new AppError("Telegram did not return a downloadable file path", 502);
+    throw new AppError("Telegram did not return a downloadable file path", {
+      statusCode: 502,
+      code: "TELEGRAM_FILE_PATH_MISSING",
+      userMessage: "I couldn't read that Telegram file. Please try sending it again.",
+      isRetryable: true
+    });
   }
+
+  return file;
+};
+
+const getTelegramFileBuffer = async (ctx: BotContext, fileId: string): Promise<Buffer> => {
+  const file = await getTelegramFile(ctx, fileId);
 
   const response = await fetch(`https://api.telegram.org/file/bot${config.BOT_TOKEN}/${file.file_path}`);
   if (!response.ok) {
-    throw new AppError("Failed to download file from Telegram", response.status);
+    throw new AppError("Failed to download file from Telegram", {
+      statusCode: response.status,
+      code: "TELEGRAM_FILE_DOWNLOAD_FAILED",
+      userMessage: "I couldn't download that file from Telegram. Please try again.",
+      isRetryable: true
+    });
   }
 
   return Buffer.from(await response.arrayBuffer());
@@ -79,24 +119,34 @@ const getTelegramFileBuffer = async (ctx: BotContext, fileId: string): Promise<B
 
 const validateFileSize = (fileSize: number | undefined): void => {
   if (fileSize !== undefined && fileSize > getFileSizeLimitBytes()) {
-    throw new AppError(
+    logger.warn("Upload file rejected", {
+      event: "upload.file.rejected",
+      reason: "file_too_large",
+      fileSizeBytes: fileSize
+    });
+    throw new ValidationError(
       `That file is too large. Please keep files under ${config.MAX_FILE_SIZE_MB ?? DEFAULT_MAX_FILE_SIZE_MB} MB.`,
-      400
+      "FILE_TOO_LARGE"
     );
   }
 };
 
-const handleCancel = async (conversation: Conversation<BotContext, BotContext>, ctx: BotContext): Promise<never> => {
-  resetSession(ctx.session);
+
+const handleCancel = async (conversation: Conversation<BotContext, BotContext>, ctx: BotContext): Promise<typeof CANCELLED> => {
+  // Session writes inside a conversation must go through external() so they are
+  // skipped on replay instead of being re-applied and corrupting state.
+  await conversation.external((liveCtx) => { resetSession(liveCtx.session); });
   await ctx.reply("Your current flow has been cancelled and your session is back to idle.");
-  throw new Error("conversation_cancelled");
+  return CANCELLED;
 };
 
-const waitForUpdate = async (conversation: Conversation<BotContext, BotContext>): Promise<BotContext> => {
+const waitForUpdate = async (
+  conversation: Conversation<BotContext, BotContext>
+): Promise<BotContext | typeof CANCELLED> => {
   const ctx = await conversation.wait();
 
   if (isCancelMessage(ctx)) {
-    await handleCancel(conversation, ctx);
+    return handleCancel(conversation, ctx);
   }
 
   return ctx;
@@ -108,14 +158,33 @@ const collectPdfUpload = async (
 ): Promise<UploadedFile[]> => {
   const document = ctx.msg?.document;
   if (!document) {
-    throw new AppError("No document found in the message", 400);
+    throw new ValidationError("No document found in the message", "DOCUMENT_MISSING");
   }
 
   if (document.mime_type !== "application/pdf") {
-    throw new AppError("That document is not a PDF. Please send a PDF or photos instead.", 400);
+    logger.warn("Upload file rejected", {
+      event: "upload.file.rejected",
+      userId: ctx.from?.id,
+      reason: "wrong_type"
+    });
+    throw new ValidationError("That document is not a PDF. Please send a PDF or photos instead.", "INVALID_PDF_TYPE");
   }
 
+  if (document.file_size !== undefined && document.file_size > getFileSizeLimitBytes()) {
+    logger.warn("Upload file rejected", {
+      event: "upload.file.rejected",
+      userId: ctx.from?.id,
+      reason: "file_too_large",
+      fileSizeBytes: document.file_size
+    });
+  }
   validateFileSize(document.file_size);
+  logger.info("Upload file received", {
+    event: "upload.file.received",
+    userId: ctx.from?.id,
+    type: "pdf",
+    fileSizeBytes: document.file_size
+  });
   await ctx.reply("Processing your file... ⏳");
 
   const base64 = await conversation.external(async () => {
@@ -129,32 +198,48 @@ const collectPdfUpload = async (
 const collectImageUploads = async (
   conversation: Conversation<BotContext, BotContext>,
   initialCtx: BotContext
-): Promise<UploadedFile[]> => {
+): Promise<UploadedFile[] | typeof CANCELLED> => {
   const uploadedFiles: UploadedFile[] = [];
   let currentCtx: BotContext | null = initialCtx;
 
   while (uploadedFiles.length < MAX_IMAGES) {
-    if (currentCtx && isPhotoMessage(currentCtx)) {
-      const message = currentCtx.msg;
-      const photo = message?.photo?.at(-1);
-      if (!photo) {
-        throw new AppError("No photo found in the message", 400);
+    // Accept both compressed photo messages and images sent via "Send as File".
+    const imageInfo = currentCtx ? extractImageFileInfo(currentCtx) : null;
+
+    if (currentCtx && imageInfo) {
+      try {
+        validateFileSize(imageInfo.fileSize);
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          await currentCtx.reply(error.userMessage);
+          currentCtx = null;
+          continue;
+        }
+        throw error;
       }
 
-      validateFileSize(photo.file_size);
       await currentCtx.reply("Processing your file... ⏳");
 
       const activeCtx = currentCtx;
+      const { fileId, mimeType } = imageInfo;
+      // Rule 3: Telegram file download must run outside replay.
       const base64 = await conversation.external(async () => {
-        const buffer = await getTelegramFileBuffer(activeCtx, photo.file_id);
+        const buffer = await getTelegramFileBuffer(activeCtx, fileId);
         return buffer.toString("base64");
       });
 
-      uploadedFiles.push({ type: "image", fileId: photo.file_id, base64 });
+      uploadedFiles.push({ type: "image", fileId, base64, mimeType });
+      logger.info("Upload file received", {
+        event: "upload.file.received",
+        userId: currentCtx.from?.id,
+        type: "image",
+        mimeType,
+        fileIndex: uploadedFiles.length
+      });
 
       if (uploadedFiles.length === 1) {
         await currentCtx.reply(
-          "Image 1 added. Send more images one by one, or tap the button when you're done.",
+          "Image 1 added. Send more images one by one, or tap the button when you’re done.",
           { reply_markup: buildDoneAddingImagesKeyboard() }
         );
       } else if (uploadedFiles.length < MAX_IMAGES) {
@@ -167,21 +252,31 @@ const collectImageUploads = async (
       break;
     }
 
-    currentCtx = await waitForUpdate(conversation);
+    const nextUpdate = await waitForUpdate(conversation);
+    if (nextUpdate === CANCELLED) {
+      return CANCELLED;
+    }
+
+    currentCtx = nextUpdate;
 
     if (currentCtx.callbackQuery?.data === DONE_ADDING_IMAGES_CALLBACK) {
       await currentCtx.answerCallbackQuery();
+      logger.info("Upload images confirmed", {
+        event: "upload.images.confirmed",
+        userId: currentCtx.from?.id,
+        imageCount: uploadedFiles.length
+      });
       break;
     }
 
-    if (isDocumentMessage(currentCtx)) {
-      await currentCtx.reply("You already started with images. Please keep sending images or tap Done adding images ✅.");
-      currentCtx = null;
-      continue;
-    }
-
-    if (!isPhotoMessage(currentCtx)) {
-      await currentCtx.reply("Please send another photo, or tap Done adding images ✅ when you’re finished.");
+    // Reject non-image updates (PDFs mid-session, plain text, etc.)
+    if (!extractImageFileInfo(currentCtx)) {
+      logger.warn("Upload file rejected", {
+        event: "upload.file.rejected",
+        userId: currentCtx.from?.id,
+        reason: "wrong_type"
+      });
+      await currentCtx.reply("Please send a photo or image file, or tap Done adding images ✅ when you’re finished.");
       currentCtx = null;
     }
   }
@@ -192,23 +287,66 @@ const collectImageUploads = async (
 const askForUpload = async (
   conversation: Conversation<BotContext, BotContext>,
   ctx: BotContext
-): Promise<UploadedFile[]> => {
-  ctx.session.state = "uploading";
-  ctx.session.uploadedFiles = undefined;
+): Promise<UploadedFile[] | typeof CANCELLED> => {
+  await conversation.external((ctx) => {
+    // Rule 1: session writes in conversations must go through external.
+    ctx.session.state = "uploading";
+    ctx.session.uploadedFiles = undefined;
+  });
+  logger.info("Upload scene entered", {
+    event: "upload.scene.enter",
+    userId: ctx.from?.id
+  });
 
   await ctx.reply("Send me a PDF or one/more images of your study material");
 
   while (true) {
     const nextCtx = await waitForUpdate(conversation);
+    if (nextCtx === CANCELLED) {
+      return CANCELLED;
+    }
+    logger.info("Upload received update", {
+      event: "upload.debug.update",
+      hasDocument: Boolean(nextCtx.msg?.document),
+      documentMimeType: nextCtx.msg?.document?.mime_type,
+      hasPhoto: Boolean(nextCtx.msg?.photo?.length),
+      hasText: Boolean(nextCtx.msg?.text),
+      updateKeys: Object.keys(nextCtx.update),
+      messageKeys: nextCtx.msg ? Object.keys(nextCtx.msg) : []
+    });
 
     if (isDocumentMessage(nextCtx)) {
-      return collectPdfUpload(conversation, nextCtx);
+      const mimeType = nextCtx.msg?.document?.mime_type ?? "";
+      if (mimeType === "application/pdf") {
+        try {
+          return await collectPdfUpload(conversation, nextCtx);
+        } catch (error) {
+          if (error instanceof ValidationError) {
+            await nextCtx.reply(error.userMessage);
+            continue;
+          }
+
+          throw error;
+        }
+      }
+      if (mimeType.startsWith("image/")) {
+        return collectImageUploads(conversation, nextCtx);
+      }
+      await nextCtx.reply(
+        "That file type isn't supported. Please send a PDF or an image (JPEG/PNG)."
+      );
+      continue;
     }
 
     if (isPhotoMessage(nextCtx)) {
       return collectImageUploads(conversation, nextCtx);
     }
 
+    logger.warn("Upload file rejected", {
+      event: "upload.file.rejected",
+      userId: nextCtx.from?.id,
+      reason: "wrong_type"
+    });
     await nextCtx.reply("Please send a PDF document or one/more images to continue.");
   }
 };
@@ -216,8 +354,11 @@ const askForUpload = async (
 const askForQuestionCount = async (
   conversation: Conversation<BotContext, BotContext>,
   ctx: BotContext
-): Promise<number> => {
-  ctx.session.state = "configuring";
+): Promise<number | typeof CANCELLED> => {
+  await conversation.external((ctx) => {
+    // Rule 1: session writes in conversations must go through external.
+    ctx.session.state = "configuring";
+  });
 
   await ctx.reply("How many questions should I generate?", {
     reply_markup: buildQuestionCountKeyboard()
@@ -225,6 +366,9 @@ const askForQuestionCount = async (
 
   while (true) {
     const nextCtx = await waitForUpdate(conversation);
+    if (nextCtx === CANCELLED) {
+      return CANCELLED;
+    }
     const callbackData = nextCtx.callbackQuery?.data;
 
     if (!callbackData?.startsWith(QUESTION_COUNT_CALLBACK_PREFIX)) {
@@ -237,6 +381,11 @@ const askForQuestionCount = async (
     const value = callbackData.slice(QUESTION_COUNT_CALLBACK_PREFIX.length);
     if (value !== "custom") {
       const count = Number(value);
+      logger.info("Question count selected", {
+        event: "upload.config.questionCount",
+        userId: nextCtx.from?.id,
+        count
+      });
       return count;
     }
 
@@ -244,6 +393,9 @@ const askForQuestionCount = async (
 
     while (true) {
       const customCtx = await waitForUpdate(conversation);
+      if (customCtx === CANCELLED) {
+        return CANCELLED;
+      }
       const rawValue = customCtx.msg?.text?.trim();
 
       if (!rawValue) {
@@ -257,6 +409,11 @@ const askForQuestionCount = async (
         continue;
       }
 
+      logger.info("Question count selected", {
+        event: "upload.config.questionCount",
+        userId: customCtx.from?.id,
+        count: parsed
+      });
       return parsed;
     }
   }
@@ -265,7 +422,7 @@ const askForQuestionCount = async (
 const askForQuestionTypes = async (
   conversation: Conversation<BotContext, BotContext>,
   ctx: BotContext
-): Promise<QuestionType[]> => {
+): Promise<QuestionType[] | typeof CANCELLED> => {
   const selectedTypes = new Set<QuestionType>(ctx.user?.defaultQuestionTypes ?? DEFAULT_QUESTION_TYPES);
   const promptText = "Which question types?";
 
@@ -275,6 +432,9 @@ const askForQuestionTypes = async (
 
   while (true) {
     const nextCtx = await waitForUpdate(conversation);
+    if (nextCtx === CANCELLED) {
+      return CANCELLED;
+    }
     const callbackData = nextCtx.callbackQuery?.data;
 
     if (!callbackData?.startsWith(QUESTION_TYPES_CALLBACK_PREFIX) && callbackData !== QUESTION_TYPES_CONFIRM_CALLBACK) {
@@ -290,6 +450,11 @@ const askForQuestionTypes = async (
         continue;
       }
 
+      logger.info("Question types selected", {
+        event: "upload.config.questionTypes",
+        userId: nextCtx.from?.id,
+        types: [...selectedTypes]
+      });
       return [...selectedTypes];
     }
 
@@ -310,7 +475,7 @@ const buildGenerateInput = (uploadedFiles: UploadedFile[], questionCount: number
   const firstFile = uploadedFiles[0];
 
   if (!firstFile) {
-    throw new AppError("No uploaded files are available for generation", 400);
+    throw new ValidationError("No uploaded files are available for generation", "UPLOAD_MISSING");
   }
 
   if (firstFile.type === "pdf") {
@@ -327,7 +492,11 @@ const buildGenerateInput = (uploadedFiles: UploadedFile[], questionCount: number
   return {
     content: {
       type: "images",
-      base64Array: uploadedFiles.map((file) => file.base64 ?? "")
+      images: uploadedFiles.map((file) => ({
+        base64: file.base64 ?? "",
+        // Fall back to jpeg if mimeType was somehow not recorded (should not happen).
+        mimeType: file.mimeType ?? "image/jpeg"
+      }))
     },
     questionCount,
     questionTypes
@@ -339,9 +508,11 @@ const isMalformedJsonError = (error: unknown): boolean =>
 
 const generateQuestions = async (
   conversation: Conversation<BotContext, BotContext>,
+  userId: number | undefined,
   input: GenerateQuestionsInput
 ): Promise<Question[]> => {
   let malformedJsonRetried = false;
+  let attempt = 1;
 
   while (true) {
     try {
@@ -349,7 +520,13 @@ const generateQuestions = async (
     } catch (error) {
       if (isMalformedJsonError(error) && !malformedJsonRetried) {
         malformedJsonRetried = true;
+        logger.warn("AI generation retry requested", {
+          event: "ai.generation.retry",
+          userId,
+          attempt
+        });
         await conversation.log("[upload] Retrying question generation after malformed JSON response");
+        attempt += 1;
         continue;
       }
 
@@ -361,23 +538,49 @@ const generateQuestions = async (
 const generateUntilSuccessOrCancel = async (
   conversation: Conversation<BotContext, BotContext>,
   ctx: BotContext
-): Promise<Question[] | null> => {
-  const uploadedFiles = ctx.session.uploadedFiles ?? [];
-  const questionCount = ctx.session.questionCount;
-  const questionTypes = ctx.session.questionTypes;
+): Promise<Question[] | typeof CANCELLED> => {
+  const { uploadedFiles, questionCount, questionTypes } = await conversation.external((ctx) => ({
+    // Rule 1: session reads in conversations must go through external.
+    uploadedFiles: ctx.session.uploadedFiles ?? [],
+    questionCount: ctx.session.questionCount,
+    questionTypes: ctx.session.questionTypes
+  }));
 
   if (!questionCount || !questionTypes?.length || uploadedFiles.length === 0) {
-    throw new AppError("Upload session is missing data required for generation", 400);
+    throw new ValidationError("Upload session is missing data required for generation", "UPLOAD_SESSION_INCOMPLETE");
   }
 
   const input = buildGenerateInput(uploadedFiles, questionCount, questionTypes);
 
   while (true) {
     await ctx.reply("Generating your questions... 🧠 This may take a moment");
+    // Rule 4: Date.now is non-deterministic, so read it outside replay.
+    const startedAt = await conversation.external(() => Date.now());
+    logger.info("AI generation started", {
+      event: "ai.generation.start",
+      userId: ctx.from?.id,
+      provider: config.AI_PROVIDER,
+      questionCount,
+      types: questionTypes
+    });
 
     try {
-      return await generateQuestions(conversation, input);
+      // Rule 3: Redis-backed rate limiting must run outside replay.
+      await conversation.external((ctx) => assertGenerationRateLimit(ctx));
+      const questions = await generateQuestions(conversation, ctx.from?.id, input);
+      logger.info("AI generation succeeded", {
+        event: "ai.generation.success",
+        userId: ctx.from?.id,
+        questionsReturned: questions.length,
+        durationMs: (await conversation.external(() => Date.now())) - startedAt
+      });
+      return questions;
     } catch (error) {
+      logger.error("AI generation failed", {
+        event: "ai.generation.failed",
+        userId: ctx.from?.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
       console.error("[upload] Question generation failed", error);
       await ctx.reply(
         "I couldn’t generate questions from that material right now. You can retry without re-uploading your file.",
@@ -386,6 +589,9 @@ const generateUntilSuccessOrCancel = async (
 
       while (true) {
         const nextCtx = await waitForUpdate(conversation);
+        if (nextCtx === CANCELLED) {
+          return CANCELLED;
+        }
 
         if (nextCtx.callbackQuery?.data === RETRY_GENERATION_CALLBACK) {
           await nextCtx.answerCallbackQuery();
@@ -402,37 +608,37 @@ export const uploadScene = async (
   conversation: Conversation<BotContext, BotContext>,
   ctx: BotContext
 ): Promise<void> => {
-  try {
-    const uploadedFiles = await askForUpload(conversation, ctx);
+  const uploadedFiles = await askForUpload(conversation, ctx);
+  if (uploadedFiles === CANCELLED) {
+    return;
+  }
+
+  const questionCount = await askForQuestionCount(conversation, ctx);
+  if (questionCount === CANCELLED) {
+    return;
+  }
+
+  const questionTypes = await askForQuestionTypes(conversation, ctx);
+  if (questionTypes === CANCELLED) {
+    return;
+  }
+
+  await conversation.external((ctx) => {
+    // Rule 1: persist wizard state outside replay before AI generation.
     ctx.session.uploadedFiles = uploadedFiles;
-
-    const questionCount = await askForQuestionCount(conversation, ctx);
     ctx.session.questionCount = questionCount;
-
-    const questionTypes = await askForQuestionTypes(conversation, ctx);
     ctx.session.questionTypes = questionTypes;
+  });
 
-    const draftQuestions = await generateUntilSuccessOrCancel(conversation, ctx);
-    if (!draftQuestions) {
-      return;
-    }
+  const draftQuestions = await generateUntilSuccessOrCancel(conversation, ctx);
+  if (draftQuestions === CANCELLED) {
+    return;
+  }
 
+  await conversation.external((ctx) => {
+    // Rule 1: session writes in conversations must go through external.
     ctx.session.state = "reviewing";
     ctx.session.draftQuestions = draftQuestions;
     ctx.session.reviewIndex = 0;
-
-    await ctx.conversation.enter(REVIEW_CONVERSATION_NAME);
-  } catch (error) {
-    if (error instanceof Error && error.message === "conversation_cancelled") {
-      return;
-    }
-
-    if (error instanceof AppError && error.statusCode < 500) {
-      await ctx.reply(error.message);
-      await ctx.conversation.enter(UPLOAD_CONVERSATION_NAME);
-      return;
-    }
-
-    throw error;
-  }
+  });
 };

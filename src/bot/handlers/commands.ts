@@ -1,5 +1,10 @@
 import type { BotCommand } from "grammy/types";
-import type { Bot } from "grammy";
+import { InlineKeyboard, type Bot } from "grammy";
+import { TestRepository } from "../../db/repositories/test.repository.js";
+import { UserRepository } from "../../db/repositories/user.repository.js";
+import { logger } from "../../shared/logger.js";
+import { registerHistoryHandler } from "./history.handler.js";
+import { registerMyTestsHandler } from "./mytests.handler.js";
 import type { BotContext } from "../types.js";
 import { REVIEW_CONVERSATION_NAME } from "../scenes/review.scene.js";
 import { TEST_CONVERSATION_NAME } from "../scenes/test.scene.js";
@@ -27,9 +32,86 @@ const helpText = [
   "/help - Show this help message"
 ].join("\n");
 
+const JOIN_AWAITING_CODE = "__awaiting_join_code__";
+const JOIN_START_CALLBACK_PREFIX = "join:start:";
+const JOIN_CANCEL_CALLBACK = "join:cancel";
+const testRepository = new TestRepository();
+const userRepository = new UserRepository();
+
 const normalizeShareCode = (value: string | undefined): string | undefined => {
-  const code = value?.trim().toUpperCase();
+  const code = value?.trim().toUpperCase().replace(/^TEST-/, "");
   return code ? code : undefined;
+};
+
+const isShareCode = (value: string | undefined): value is string => Boolean(value && /^[A-Z0-9]{6}$/.test(value));
+
+const formatQuestionTypes = (types: string[]): string =>
+  [...new Set(types)].map((type) => {
+    switch (type) {
+      case "mcq":
+        return "MCQ";
+      case "truefalse":
+        return "True/False";
+      case "short":
+        return "Short";
+      case "fill":
+        return "Fill";
+      default:
+        return type;
+    }
+  }).join(", ");
+
+const buildPreviewKeyboard = (testId: string): InlineKeyboard =>
+  new InlineKeyboard()
+    .text("▶️ Start Test", `${JOIN_START_CALLBACK_PREFIX}${testId}`)
+    .text("❌ Cancel", JOIN_CANCEL_CALLBACK);
+
+const showTestPreview = async (ctx: BotContext, testId: string): Promise<void> => {
+  const test = await testRepository.findById(testId);
+  if (!test || !test.isActive) {
+    await ctx.reply("This test link is expired or invalid ❌");
+    return;
+  }
+
+  const creator = await userRepository.findById(test.creatorId);
+  const creatorLabel = creator?.username ? `@${creator.username}` : "Unknown creator";
+  const title = test.title?.trim() || "Untitled Test";
+  const questionTypes = formatQuestionTypes(test.questions.map((question) => question.type));
+
+  await ctx.reply(
+    [
+      `📝 Test: ${title}`,
+      `Questions: ${test.questions.length}`,
+      `Types: ${questionTypes}`,
+      `Created by: ${creatorLabel}`
+    ].join("\n"),
+    { reply_markup: buildPreviewKeyboard(String(test._id)) }
+  );
+};
+
+const previewSharedTest = async (ctx: BotContext, shareCode: string): Promise<void> => {
+  const test = await testRepository.findByShareCode(shareCode);
+  if (!test) {
+    await ctx.reply("This test link is expired or invalid ❌");
+    return;
+  }
+
+  await showTestPreview(ctx, String(test._id));
+};
+
+const startPreviewedTest = async (ctx: BotContext, testId: string): Promise<void> => {
+  // Exit all conversations before resetting session to avoid stale grammY history.
+  // This version of @grammyjs/conversations has no zero-arg exit() overload — call per name.
+  await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME);
+  await ctx.conversation.exit(REVIEW_CONVERSATION_NAME);
+  await ctx.conversation.exit(TEST_CONVERSATION_NAME);
+  resetSession(ctx.session);
+  ctx.session.activeTestId = testId;
+  ctx.session.state = "testing";
+  // Ensure leftover sessionId/index from a previous run do not bleed in.
+  ctx.session.sessionId = undefined;
+  ctx.session.currentQuestionIndex = 0;
+  await ctx.conversation.enter(TEST_CONVERSATION_NAME);
 };
 
 export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<void> => {
@@ -37,14 +119,16 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
   bot.command("start", async (ctx) => {
     const deepLinkCode = normalizeShareCode(typeof ctx.match === "string" ? ctx.match : undefined);
+    logger.info("Start command received", {
+      event: "command.start",
+      userId: ctx.from?.id,
+      hasDeepLink: isShareCode(deepLinkCode)
+    });
 
     resetSession(ctx.session);
 
-    if (deepLinkCode) {
-      ctx.session.pendingJoinCode = deepLinkCode;
-      await ctx.reply(
-        `Welcome to Quiz Bot. I found share code ${deepLinkCode} in your start link and saved it for the join flow.`
-      );
+    if (isShareCode(deepLinkCode)) {
+      await previewSharedTest(ctx, deepLinkCode);
       return;
     }
 
@@ -54,42 +138,87 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   });
 
   bot.command("newtest", async (ctx) => {
+    logger.info("New test command received", {
+      event: "command.newtest",
+      userId: ctx.from?.id
+    });
+    // Exit all active conversations before resetting state so grammY can clean
+    // up its internal conversation history before we wipe the session.
+    await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME);
+    await ctx.conversation.exit(REVIEW_CONVERSATION_NAME);
+    await ctx.conversation.exit(TEST_CONVERSATION_NAME);
     resetSession(ctx.session);
-    await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME).catch(() => undefined);
-    await ctx.conversation.exit(REVIEW_CONVERSATION_NAME).catch(() => undefined);
     await ctx.conversation.enter(UPLOAD_CONVERSATION_NAME);
+    // NOTE: the previous code checked ctx.session.state === "reviewing" here,
+    // but resetSession() just set state to "idle", so that branch was dead code.
+    // Removed to avoid confusion.
   });
 
   bot.command("join", async (ctx) => {
     const shareCode = normalizeShareCode(typeof ctx.match === "string" ? ctx.match : undefined);
+    logger.info("Join command received", {
+      event: "command.join",
+      userId: ctx.from?.id,
+      code: shareCode ?? null
+    });
 
-    if (!shareCode) {
-      ctx.session.pendingJoinCode = undefined;
-      await ctx.reply("Send me the 6-character share code and I’ll prepare the join flow.");
+    if (!isShareCode(shareCode)) {
+      ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
+      await ctx.reply("Send me the 6-character share code.");
       return;
     }
 
-    ctx.session.pendingJoinCode = shareCode;
-    await ctx.reply(`Share code ${shareCode} saved. I’ll use it when the join flow is connected.`);
-  });
-
-  bot.command("mytests", async (ctx) => {
-    await ctx.reply("Coming soon.");
-  });
-
-  bot.command("history", async (ctx) => {
-    await ctx.reply("Coming soon.");
+    ctx.session.pendingJoinCode = undefined;
+    await previewSharedTest(ctx, shareCode);
   });
 
   bot.command("cancel", async (ctx) => {
+    logger.info("Cancel command received", {
+      event: "command.cancel",
+      userId: ctx.from?.id
+    });
+    // Exit all active conversations first so grammY clears its history, then
+    // reset the session — if the order is reversed, the session is wiped before
+    // the conversation exit logic can reference it.
+    await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME);
+    await ctx.conversation.exit(REVIEW_CONVERSATION_NAME);
+    await ctx.conversation.exit(TEST_CONVERSATION_NAME);
     resetSession(ctx.session);
-    await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME).catch(() => undefined);
-    await ctx.conversation.exit(REVIEW_CONVERSATION_NAME).catch(() => undefined);
-    await ctx.conversation.exit(TEST_CONVERSATION_NAME).catch(() => undefined);
     await ctx.reply("Your current flow has been cancelled and your session is back to idle.");
   });
 
   bot.command("help", async (ctx) => {
     await ctx.reply(helpText);
   });
+
+  bot.on("message:text", async (ctx, next) => {
+    if (ctx.session.pendingJoinCode !== JOIN_AWAITING_CODE) {
+      await next();
+      return;
+    }
+
+    const shareCode = normalizeShareCode(ctx.msg.text);
+    if (!isShareCode(shareCode)) {
+      await ctx.reply("That code doesn't look right. Please send a 6-character code like ABC123.");
+      return;
+    }
+
+    ctx.session.pendingJoinCode = undefined;
+    await previewSharedTest(ctx, shareCode);
+  });
+
+  bot.callbackQuery(new RegExp(`^${JOIN_START_CALLBACK_PREFIX}`), async (ctx) => {
+    const testId = ctx.callbackQuery.data.slice(JOIN_START_CALLBACK_PREFIX.length);
+    await ctx.answerCallbackQuery();
+    await startPreviewedTest(ctx, testId);
+  });
+
+  bot.callbackQuery(JOIN_CANCEL_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    ctx.session.pendingJoinCode = undefined;
+    await ctx.reply("Join cancelled.");
+  });
+
+  registerMyTestsHandler(bot);
+  registerHistoryHandler(bot);
 };

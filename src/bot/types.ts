@@ -10,10 +10,13 @@ export type UploadedFile = {
   type: "pdf" | "image";
   fileId: string;
   base64?: string;
+  /** Actual MIME type of the image (e.g. "image/jpeg", "image/png"). Absent for PDFs. */
+  mimeType?: string;
 };
 
 export type BotSession = {
   state: BotSessionState;
+  sessionRecovered?: boolean;
   uploadedFiles?: UploadedFile[];
   questionCount?: number;
   questionTypes?: QuestionType[];
@@ -22,6 +25,7 @@ export type BotSession = {
   activeTestId?: string;
   currentQuestionIndex?: number;
   sessionId?: string;
+  activeTestSlotId?: string;
   pendingJoinCode?: string;
 };
 
@@ -30,6 +34,7 @@ export type BotContext = ConversationFlavor<
     SessionFlavor<BotSession> & {
       user?: UserDocument;
       redis: Redis;
+      retryAction?: string;
     }
 >;
 

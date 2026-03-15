@@ -1,4 +1,4 @@
-import { model, models, Schema, type HydratedDocument, type InferSchemaType, type Model, type Types } from "mongoose";
+import mongoose, { model, Schema, type HydratedDocument, type InferSchemaType, type Model, type Types } from "mongoose";
 import { DEFAULT_QUESTION_TYPES } from "../../shared/types/index.js";
 
 const questionOptionsSchema = new Schema(
@@ -45,9 +45,10 @@ const testSchema = new Schema(
   {
     shareCode: {
       type: String,
-      required: true,
+      required: false,
       unique: true,
       index: true,
+      sparse: true,
       uppercase: true,
       minlength: 6,
       maxlength: 6,
@@ -56,7 +57,8 @@ const testSchema = new Schema(
     creatorId: {
       type: Schema.Types.ObjectId,
       ref: "User",
-      required: true
+      required: true,
+      index: true  // needed for findByCreator / countByCreator queries
     },
     title: {
       type: String,
@@ -91,4 +93,4 @@ export type Test = InferSchemaType<typeof testSchema> & {
 export type TestDocument = HydratedDocument<Test>;
 type TestModel = Model<Test>;
 
-export const TestModel = (models.Test as TestModel | undefined) ?? model<Test>("Test", testSchema);
+export const TestModel = (mongoose.models.Test as TestModel | undefined) ?? model<Test>("Test", testSchema);
