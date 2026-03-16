@@ -42,7 +42,10 @@ export class OllamaProvider implements IAIProvider {
       });
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        throw new AIError("Ollama request timed out", { timeoutMs: config.AI_TIMEOUT_MS }, false);
+        throw new AIError("Ollama request timed out", {
+          code: "TIMEOUT",
+          details: { timeoutMs: config.AI_TIMEOUT_MS }
+        });
       }
       throw error;
     } finally {
@@ -52,6 +55,12 @@ export class OllamaProvider implements IAIProvider {
     const payload = (await response.json()) as OllamaResponse;
 
     if (!response.ok) {
+      if (response.status === 429) {
+        throw new AIError("Ollama rate limit reached", {
+          code: "RATE_LIMIT",
+          details: payload
+        });
+      }
       throw new AppError(payload.error ?? "Ollama request failed", response.status, payload);
     }
 

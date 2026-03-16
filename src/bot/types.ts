@@ -6,7 +6,7 @@ import type { Language } from "../shared/i18n/index.js";
 
 export type BotSessionState = "idle" | "uploading" | "configuring" | "reviewing" | "testing" | "done" | "editing";
 
-export type UploadStep = "waiting_file" | "waiting_text" | "waiting_count" | "waiting_count_custom" | "waiting_types" | "waiting_shuffle" | "waiting_timer" | "waiting_title" | "waiting_action";
+export type UploadStep = "waiting_file" | "waiting_text" | "waiting_count" | "waiting_count_custom" | "waiting_types" | "waiting_shuffle" | "waiting_timer" | "waiting_title" | "waiting_retry" | "waiting_action";
 
 export type ReviewSubState = "idle" | "editing_answer";
 

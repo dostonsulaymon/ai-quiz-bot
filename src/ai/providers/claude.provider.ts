@@ -53,7 +53,10 @@ export class ClaudeProvider implements IAIProvider {
       });
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        throw new AIError("Claude request timed out", { timeoutMs: config.AI_TIMEOUT_MS }, false);
+        throw new AIError("Claude request timed out", {
+          code: "TIMEOUT",
+          details: { timeoutMs: config.AI_TIMEOUT_MS }
+        });
       }
       throw error;
     } finally {
@@ -63,6 +66,12 @@ export class ClaudeProvider implements IAIProvider {
     const payload = (await response.json()) as ClaudeResponse;
 
     if (!response.ok) {
+      if (response.status === 429) {
+        throw new AIError("Claude rate limit reached", {
+          code: "RATE_LIMIT",
+          details: payload
+        });
+      }
       throw new AppError(payload.error?.message ?? "Claude request failed", response.status, payload);
     }
 

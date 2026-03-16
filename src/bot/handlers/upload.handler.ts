@@ -3,7 +3,10 @@ import { generateWithFallback } from "../../ai/ai.factory.js";
 import { assertGenerationRateLimit } from "../middlewares/rateLimitMiddleware.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { AIError } from "../../shared/errors/AIError.js";
 import { logger } from "../../shared/logger.js";
+import { recordAIGeneration } from "../../shared/metrics.js";
+import { RateLimitError } from "../../shared/errors/RateLimitError.js";
 import { ValidationError } from "../../shared/errors/ValidationError.js";
 import { type GenerateQuestionsInput, type QuestionType } from "../../shared/types/index.js";
 import { resetSession, type BotContext, type UploadedFile } from "../types.js";
@@ -18,6 +21,7 @@ const testRepository = new TestRepository();
 
 const DONE_ADDING_IMAGES_CALLBACK = "upload:images:done";
 const RETRY_GENERATION_CALLBACK = "upload:generation:retry";
+const CANCEL_RETRY_CALLBACK = "upload:generation:cancel";
 const TITLE_SKIP_CALLBACK = "upload:title:skip";
 const TEXT_START_CALLBACK = "upload:text:start";
 const QUESTION_COUNT_CALLBACK_PREFIX = "upload:count:";
@@ -30,6 +34,8 @@ const MAX_IMAGES = 10;
 const MAX_CUSTOM_QUESTION_COUNT = 50;
 const DEFAULT_MAX_FILE_SIZE_MB = 20;
 const FILE_DOWNLOAD_TIMEOUT_MS = 30_000;
+const RATE_LIMIT_RETRY_DELAY_SECONDS = 30;
+const SESSION_KEY_PREFIX = "quiz-bot:session:";
 
 const getFileSizeLimitBytes = (): number => (config.MAX_FILE_SIZE_MB ?? DEFAULT_MAX_FILE_SIZE_MB) * 1024 * 1024;
 
@@ -111,8 +117,10 @@ const buildQuestionTypesKeyboard = (
 const buildDoneAddingImagesKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard().text(t(lang, "upload.btn.doneAddingImages"), DONE_ADDING_IMAGES_CALLBACK);
 
-const buildRetryKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard().text(t(lang, "upload.btn.retryGeneration"), RETRY_GENERATION_CALLBACK);
+const buildRetryKeyboard = (lang: Language, retryLabel?: string): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(retryLabel ?? t(lang, "upload.retry.btn"), RETRY_GENERATION_CALLBACK)
+    .text(t(lang, "btn.cancel"), CANCEL_RETRY_CALLBACK);
 
 const buildShuffleKeyboard = (
   lang: Language,
@@ -187,7 +195,6 @@ const getTelegramFileBuffer = async (ctx: BotContext, fileId: string): Promise<B
     throw new AppError("Telegram did not return a downloadable file path", {
       statusCode: 502,
       code: "TELEGRAM_FILE_PATH_MISSING",
-      userMessage: "I couldn't read that Telegram file. Please try sending it again.",
       isRetryable: true
     });
   }
@@ -202,7 +209,6 @@ const getTelegramFileBuffer = async (ctx: BotContext, fileId: string): Promise<B
       throw new AppError("Failed to download file from Telegram", {
         statusCode: response.status,
         code: "TELEGRAM_FILE_DOWNLOAD_FAILED",
-        userMessage: "I couldn't download that file from Telegram. Please try again.",
         isRetryable: true
       });
     }
@@ -267,6 +273,79 @@ const buildGenerateInput = (
 
 const buildUploadPromptKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard().text(t(lang, "upload.text.btn"), TEXT_START_CALLBACK);
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const getSessionStorageKey = (ctx: BotContext): string | null =>
+  ctx.from?.id && ctx.chat?.id ? `${SESSION_KEY_PREFIX}${ctx.from.id}:${ctx.chat.id}` : null;
+
+const isRetryPendingInStorage = async (ctx: BotContext): Promise<boolean> => {
+  const key = getSessionStorageKey(ctx);
+  if (!key) return false;
+
+  const raw = await ctx.redis.get(key);
+  if (!raw) return false;
+
+  try {
+    const session = JSON.parse(raw) as { uploadStep?: string; state?: string };
+    return session.state === "configuring" && session.uploadStep === "waiting_retry";
+  } catch {
+    return false;
+  }
+};
+
+const mapGenerationError = (
+  error: unknown,
+  lang: Language
+): { message: string; isRateLimit: boolean; retryLabel?: string } => {
+  if (error instanceof AIError && error.code === "TIMEOUT") {
+    return { message: t(lang, "upload.error.timeout"), isRateLimit: false };
+  }
+
+  if (
+    error instanceof RateLimitError ||
+    (error instanceof AIError && error.code === "RATE_LIMIT") ||
+    (error instanceof AppError && error.code === "RATE_LIMIT_EXCEEDED")
+  ) {
+    return {
+      message: t(lang, "upload.error.rate_limit"),
+      isRateLimit: true,
+      retryLabel: t(lang, "upload.retry.btn.delayed", { n: RATE_LIMIT_RETRY_DELAY_SECONDS })
+    };
+  }
+
+  if (error instanceof AIError && error.code === "ALL_PROVIDERS_FAILED") {
+    return { message: t(lang, "upload.error.all_failed"), isRateLimit: false };
+  }
+
+  return { message: t(lang, "upload.error.generic"), isRateLimit: false };
+};
+
+const scheduleRateLimitRetry = (ctx: BotContext, messageId: number, lang: Language): void => {
+  void (async () => {
+    for (let remaining = RATE_LIMIT_RETRY_DELAY_SECONDS; remaining >= 1; remaining--) {
+      const stillWaiting = await isRetryPendingInStorage(ctx);
+      if (!stillWaiting) return;
+
+      await ctx.api.editMessageText(
+        ctx.chatId!,
+        messageId,
+        t(lang, "upload.retry.rate_limit_countdown", { n: remaining }),
+        {
+          reply_markup: buildRetryKeyboard(lang, t(lang, "upload.retry.btn.delayed", { n: remaining }))
+        }
+      ).catch(() => undefined);
+
+      await sleep(1_000);
+    }
+
+    const stillWaiting = await isRetryPendingInStorage(ctx);
+    if (!stillWaiting) return;
+
+    await ctx.api.editMessageText(ctx.chatId!, messageId, t(lang, "upload.retry.retrying")).catch(() => undefined);
+    await runGeneration(ctx, true);
+  })();
+};
 
 /** Enter the upload flow: reset session, pre-populate user defaults, set state, send prompt. */
 export const enterUploadFlow = async (ctx: BotContext): Promise<void> => {
@@ -399,8 +478,12 @@ const handlePdfUpload = async (ctx: BotContext): Promise<void> => {
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
       await ctx.reply(t(lang, "error.file_download_timeout"));
+    } else if (error instanceof AppError && error.code === "TELEGRAM_FILE_PATH_MISSING") {
+      await ctx.reply(t(lang, "upload.telegram_read_error"));
+    } else if (error instanceof AppError && error.code === "TELEGRAM_FILE_DOWNLOAD_FAILED") {
+      await ctx.reply(t(lang, "upload.telegram_download_failed"));
     } else {
-      const msg = error instanceof AppError ? (error.userMessage ?? error.message) : t(lang, "upload.downloadError");
+      const msg = error instanceof AppError ? error.message : t(lang, "upload.downloadError");
       await ctx.reply(msg);
     }
     return;
@@ -438,8 +521,12 @@ const handleFirstImage = async (ctx: BotContext): Promise<void> => {
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
       await ctx.reply(t(lang, "error.file_download_timeout"));
+    } else if (error instanceof AppError && error.code === "TELEGRAM_FILE_PATH_MISSING") {
+      await ctx.reply(t(lang, "upload.telegram_read_error"));
+    } else if (error instanceof AppError && error.code === "TELEGRAM_FILE_DOWNLOAD_FAILED") {
+      await ctx.reply(t(lang, "upload.telegram_download_failed"));
     } else {
-      const msg = error instanceof AppError ? (error.userMessage ?? error.message) : t(lang, "upload.imageDownloadError");
+      const msg = error instanceof AppError ? error.message : t(lang, "upload.imageDownloadError");
       await ctx.reply(msg);
     }
     return;
@@ -511,8 +598,12 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
       await ctx.reply(t(lang, "error.file_download_timeout"));
+    } else if (error instanceof AppError && error.code === "TELEGRAM_FILE_PATH_MISSING") {
+      await ctx.reply(t(lang, "upload.telegram_read_error"));
+    } else if (error instanceof AppError && error.code === "TELEGRAM_FILE_DOWNLOAD_FAILED") {
+      await ctx.reply(t(lang, "upload.telegram_download_failed"));
     } else {
-      const msg = error instanceof AppError ? (error.userMessage ?? error.message) : t(lang, "upload.imageDownloadError");
+      const msg = error instanceof AppError ? error.message : t(lang, "upload.imageDownloadError");
       await ctx.reply(msg);
     }
     return;
@@ -771,7 +862,7 @@ const handleWaitingTypes = async (ctx: BotContext): Promise<void> => {
 // Generation
 // ---------------------------------------------------------------------------
 
-const runGeneration = async (ctx: BotContext): Promise<void> => {
+const runGeneration = async (ctx: BotContext, isRetry = false): Promise<void> => {
   const { uploadedFiles, uploadedText, uploadSourceType, questionCount, questionTypes } = ctx.session;
   const lang = ctx.lang();
 
@@ -802,7 +893,7 @@ const runGeneration = async (ctx: BotContext): Promise<void> => {
   }
 
   await ctx.replyWithChatAction("typing");
-  const thinkingMsg = await ctx.reply(t(lang, "upload.generating"));
+  const thinkingMsg = await ctx.reply(isRetry ? t(lang, "upload.retry.retrying") : t(lang, "upload.generating"));
 
   const startedAt = Date.now();
   logger.info("AI generation started", {
@@ -825,6 +916,7 @@ const runGeneration = async (ctx: BotContext): Promise<void> => {
       questionsReturned: questions.length,
       durationMs: Date.now() - startedAt
     });
+    recordAIGeneration(true, Date.now() - startedAt);
 
     ctx.session.draftQuestions = questions;
     ctx.session.reviewIndex = 0;
@@ -835,15 +927,23 @@ const runGeneration = async (ctx: BotContext): Promise<void> => {
     }
     // Keep uploadedFiles/uploadedText in session — review flow may need them for regeneration.
   } catch (error) {
+    const durationMs = Date.now() - startedAt;
     logger.error("AI generation failed", {
       event: "ai.generation.failed",
       userId: ctx.from?.id,
       error: error instanceof Error ? error.message : String(error)
     });
+    recordAIGeneration(false, durationMs);
 
-    await ctx.reply(t(lang, "upload.generationFailed"), { reply_markup: buildRetryKeyboard(lang) });
+    ctx.session.uploadStep = "waiting_retry";
+    const failure = mapGenerationError(error, lang);
+    const retryMessage = await ctx.reply(failure.message, {
+      reply_markup: buildRetryKeyboard(lang, failure.retryLabel)
+    });
 
-    ctx.session.uploadStep = "waiting_types"; // stay in types step, waiting for retry
+    if (failure.isRateLimit) {
+      scheduleRateLimitRetry(ctx, retryMessage.message_id, lang);
+    }
   } finally {
     await ctx.api.deleteMessage(ctx.chatId!, thinkingMsg.message_id).catch(() => undefined);
   }
@@ -882,6 +982,13 @@ const runGeneration = async (ctx: BotContext): Promise<void> => {
 
     await ctx.reply(text, { reply_markup: buildActionKeyboard(lang) });
   }
+};
+
+const cancelRetry = async (ctx: BotContext): Promise<void> => {
+  const storageKeys = (ctx.session.uploadedFiles ?? []).map((file) => file.storageKey);
+  await deleteAllUploadData(ctx.redis, storageKeys);
+  resetSession(ctx.session);
+  await ctx.reply(t(ctx.lang(), "upload.retry.cancelled"));
 };
 
 // ---------------------------------------------------------------------------
@@ -1019,13 +1126,26 @@ export const uploadRouterFull = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
-  if (step === "waiting_types") {
-    // Handle retry button
-    if (ctx.callbackQuery?.data === RETRY_GENERATION_CALLBACK) {
+  if (step === "waiting_retry") {
+    if (ctx.callbackQuery?.data === CANCEL_RETRY_CALLBACK) {
       await ctx.answerCallbackQuery();
-      await runGeneration(ctx);
+      await cancelRetry(ctx);
       return;
     }
+
+    if (ctx.callbackQuery?.data === RETRY_GENERATION_CALLBACK) {
+      await ctx.answerCallbackQuery();
+      await runGeneration(ctx, true);
+      return;
+    }
+
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery();
+    }
+    return;
+  }
+
+  if (step === "waiting_types") {
     await handleWaitingTypes(ctx);
   }
 };

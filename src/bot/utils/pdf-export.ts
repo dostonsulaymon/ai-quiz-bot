@@ -3,7 +3,7 @@ import { readFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import type { TestDocument } from "../../db/models/test.model.js";
-import { formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
+import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -53,11 +53,11 @@ export async function generateTestPDF(
       doc.registerFont("NotoSans", NOTO_SANS_PATH);
     }
 
-    applyBodyFont(doc, boldFont, 20).text(test.title?.trim() || "Untitled Test", { align: "center" });
+    applyBodyFont(doc, boldFont, 20).text(test.title?.trim() || t(lang, "common.untitledTest"), { align: "center" });
     doc.moveDown();
 
     applyBodyFont(doc, bodyFont, 10).text(
-      `${test.questions.length} questions • ${formatQuestionTypes(test.questions.map((question) => question.type), lang)}`,
+      `${t(lang, "mytests.preview.questions", { n: test.questions.length })} • ${formatQuestionTypes(test.questions.map((question) => question.type), lang)}`,
       { align: "center" }
     );
     doc.moveDown(2);
@@ -76,7 +76,7 @@ export async function generateTestPDF(
       } else if (question.type === "truefalse") {
         applyBodyFont(doc, bodyFont, 11).text("   A) True    B) False");
       } else {
-        applyBodyFont(doc, bodyFont, 11).text("   Answer: ___________________________");
+        applyBodyFont(doc, bodyFont, 11).text(`   ${t(lang, "mytests.export.answerLine")}`);
       }
 
       if (includeAnswers) {

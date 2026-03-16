@@ -10,6 +10,7 @@ import { createInitialSession } from "./types.js";
 import { stateRouter } from "./router.js";
 import { logger } from "../shared/logger.js";
 import { t } from "../shared/i18n/index.js";
+import { recordUpdate } from "../shared/metrics.js";
 
 export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
@@ -47,6 +48,13 @@ export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
 
   // userMiddleware detects language and overwrites ctx.lang with the real value.
   bot.use(userMiddleware);
+
+  bot.use(async (ctx, next) => {
+    if (ctx.from?.id) {
+      recordUpdate(ctx.from.id);
+    }
+    await next();
+  });
 
   // Session recovery reply now runs after userMiddleware so it can use ctx.lang().
   bot.use(async (ctx, next) => {

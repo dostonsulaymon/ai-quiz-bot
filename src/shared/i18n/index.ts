@@ -16,7 +16,7 @@ export const t = (
   key: keyof TranslationMap,
   vars?: Record<string, string | number>
 ): string => {
-  const template = translations[lang][key] ?? translations.en[key];
+  const template = translations[lang][key] ?? translations.en[key] ?? String(key);
   if (!vars) return template;
   return template.replace(/\{(\w+)\}/g, (_, k: string) => String(vars[k] ?? `{${k}}`));
 };

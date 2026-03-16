@@ -1,3 +1,5 @@
+import * as Sentry from "@sentry/node";
+import { createServer } from "node:http";
 import mongoose from "mongoose";
 import { createBot } from "./bot/index.js";
 import { config } from "./config/index.js";
@@ -8,8 +10,18 @@ import { TestSessionRepository } from "./db/repositories/test-session.repository
 import { TestRepository } from "./db/repositories/test.repository.js";
 import { runGroupAutoAdvance } from "./bot/handlers/group.handler.js";
 import { logger } from "./shared/logger.js";
+import { getMetrics } from "./shared/metrics.js";
 import type { BotSession } from "./bot/types.js";
 import type { Language } from "./shared/i18n/index.js";
+
+if (config.SENTRY_DSN) {
+  Sentry.init({
+    dsn: config.SENTRY_DSN,
+    environment: config.NODE_ENV,
+    tracesSampleRate: 0.1
+  });
+  logger.info("Sentry error tracking initialized");
+}
 
 const SESSION_KEY_PREFIX = "quiz-bot:session:";
 
@@ -93,6 +105,36 @@ const recoverExpiredGroupTimers = async (
 };
 
 const bootstrap = async (): Promise<void> => {
+  const monitoringPort = Number(process.env.PORT) || config.HEALTH_CHECK_PORT;
+  const monitoringServer = createServer((req, res) => {
+    if (req.url === "/health" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (req.url === "/metrics" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(getMetrics()));
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    monitoringServer.once("error", reject);
+    monitoringServer.listen(monitoringPort, () => {
+      monitoringServer.off("error", reject);
+      logger.info("Monitoring HTTP server started", {
+        event: "monitoring.server.started",
+        port: monitoringPort
+      });
+      resolve();
+    });
+  });
+
   const redis = createRedisClient();
   await redis.connect();
   await connectToDatabase();
@@ -144,6 +186,9 @@ const bootstrap = async (): Promise<void> => {
           event: "startup.session_cleanup.hourly_failed",
           error: error instanceof Error ? error.message : String(error)
         });
+        if (config.SENTRY_DSN) {
+          Sentry.captureException(error);
+        }
       }
     })();
   }, 60 * 60 * 1000);
@@ -153,7 +198,19 @@ const bootstrap = async (): Promise<void> => {
     console.info(`[app] Received ${signal}, shutting down gracefully`);
 
     await bot.stop();
-    await Promise.allSettled([mongoose.disconnect(), redis.quit()]);
+    await Promise.allSettled([
+      new Promise<void>((resolve, reject) => {
+        monitoringServer.close((error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          resolve();
+        });
+      }),
+      mongoose.disconnect(),
+      redis.quit()
+    ]);
 
     process.exit(0);
   };
@@ -169,5 +226,9 @@ const bootstrap = async (): Promise<void> => {
 
 void bootstrap().catch(async (error: unknown) => {
   console.error("[app] Failed to start application", error);
+  if (config.SENTRY_DSN) {
+    Sentry.captureException(error);
+    await Sentry.flush(2_000).catch(() => undefined);
+  }
   process.exit(1);
 });

@@ -51,8 +51,8 @@ export const assertGenerationRateLimit = async (ctx: BotContext): Promise<void> 
     await ctx.redis.decr(dailyKey);
     throw new RateLimitError(
       "Daily API limit exceeded",
-      `You've reached your daily limit of ${config.RATE_LIMIT_DAILY_MAX} tests. Resets in ${formatDuration(daily.ttl)} ⏰`,
-      { limit: config.RATE_LIMIT_DAILY_MAX, ttl: daily.ttl }
+      "error.rateLimit_daily",
+      { limit: config.RATE_LIMIT_DAILY_MAX, duration: formatDuration(daily.ttl) }
     );
   }
 
@@ -63,8 +63,8 @@ export const assertGenerationRateLimit = async (ctx: BotContext): Promise<void> 
     await ctx.redis.decr(key);
     throw new RateLimitError(
       "Hourly generation limit exceeded",
-      `You've reached your hourly generation limit of ${config.RATE_LIMIT_GENERATIONS_PER_HOUR}. Resets in ${formatDuration(ttl)} ⏰`,
-      { limit: config.RATE_LIMIT_GENERATIONS_PER_HOUR, ttl }
+      "error.rateLimit_hourly",
+      { limit: config.RATE_LIMIT_GENERATIONS_PER_HOUR, duration: formatDuration(ttl) }
     );
   }
 };
@@ -88,8 +88,8 @@ export const acquireActiveTestSessionSlot = async (ctx: BotContext): Promise<voi
     const ttl = await ctx.redis.ttl(key);
     throw new RateLimitError(
       "Too many concurrent test sessions",
-      `You've reached the limit of ${MAX_CONCURRENT_TEST_SESSIONS} active test sessions. Try again in ${formatDuration(ttl > 0 ? ttl : ACTIVE_SESSION_TTL_SECONDS)} ⏰`,
-      { limit: MAX_CONCURRENT_TEST_SESSIONS, ttl }
+      "error.rateLimit_concurrent",
+      { limit: MAX_CONCURRENT_TEST_SESSIONS, duration: formatDuration(ttl > 0 ? ttl : ACTIVE_SESSION_TTL_SECONDS) }
     );
   }
 

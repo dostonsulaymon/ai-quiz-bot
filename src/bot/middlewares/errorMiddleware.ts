@@ -1,6 +1,9 @@
+import * as Sentry from "@sentry/node";
 import { InlineKeyboard, type BotError, type Bot as GrammyBot } from "grammy";
+import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
 import { logger } from "../../shared/logger.js";
+import { recordError } from "../../shared/metrics.js";
 import type { BotContext } from "../types.js";
 import { t } from "../../shared/i18n/index.js";
 
@@ -24,6 +27,7 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
   bot.catch(async (error: BotError<BotContext>) => {
     const lang = error.ctx.lang();
     const appError = toAppError(error.error);
+    recordError();
     logger.error("Unhandled bot error", {
       code: appError.code,
       userId: error.ctx.from?.id,
@@ -31,6 +35,16 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
       stack: error.error instanceof Error ? error.error.stack : undefined,
       details: appError.details
     });
+
+    if (config.SENTRY_DSN) {
+      Sentry.captureException(error.error, {
+        extra: {
+          userId: error.ctx.from?.id,
+          updateType: Object.keys(error.ctx.update)[0] ?? "unknown",
+          sessionState: error.ctx.session?.state
+        }
+      });
+    }
 
     try {
       const keyboard = appError.isRetryable
@@ -40,7 +54,7 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
       const message =
         appError.code === "UNEXPECTED_ERROR" || appError.userMessage === "GENERIC"
           ? t(lang, "error.generic")
-          : (appError.userMessage ?? t(lang, "error.generic"));
+          : t(lang, appError.userMessage as any, appError.details as Record<string, string | number>);
 
       await error.ctx.reply(message, {
         reply_markup: keyboard

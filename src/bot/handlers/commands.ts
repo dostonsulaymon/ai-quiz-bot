@@ -177,6 +177,16 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     resetSession(ctx.session);
 
+    if (ctx.shouldPromptLanguage) {
+      if (payload?.startsWith("TEST-")) {
+        ctx.session.pendingJoinCode = normalizeShareCode(payload);
+      }
+      ctx.session.awaitingLangForWelcome = true;
+      const prompt = `${t("en", "language.auto_prompt")}\n${t("uz", "language.auto_prompt_uz")}`;
+      await ctx.reply(prompt, { reply_markup: buildLanguageKeyboard(ctx.lang()) });
+      return;
+    }
+
     if (payload?.startsWith("TEST-")) {
       return handleJoinByCode(ctx, payload);
     }
@@ -186,13 +196,6 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     }
 
     const lang = ctx.lang();
-
-    if (ctx.shouldPromptLanguage) {
-      ctx.session.awaitingLangForWelcome = true;
-      const prompt = `${t("en", "language.auto_prompt")}\n${t("uz", "language.auto_prompt_uz")}`;
-      await ctx.reply(prompt, { reply_markup: buildLanguageKeyboard(lang) });
-      return;
-    }
 
     const text = ctx.isNewUser
       ? t(lang, "start.welcome_new", { name: ctx.from?.first_name ?? "" })
@@ -425,6 +428,14 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     if (ctx.session.awaitingLangForWelcome) {
       ctx.session.awaitingLangForWelcome = undefined;
+      
+      if (ctx.session.pendingJoinCode && ctx.session.pendingJoinCode !== JOIN_AWAITING_CODE) {
+        const code = ctx.session.pendingJoinCode;
+        ctx.session.pendingJoinCode = undefined;
+        await previewSharedTest(ctx, code);
+        return;
+      }
+
       const text = ctx.isNewUser
         ? t(newLang, "start.welcome_new", { name: ctx.from?.first_name ?? "" })
         : t(newLang, "start.welcome_returning");

@@ -18,6 +18,8 @@ type Config = {
   GEMINI_MODEL?: string;
   OLLAMA_BASE_URL?: string;
   OLLAMA_MODEL?: string;
+  SENTRY_DSN?: string;
+  HEALTH_CHECK_PORT: number;
   NODE_ENV: NodeEnv;
   MAX_QUESTIONS_PER_TEST: number;
   MAX_FILE_SIZE_MB: number;
@@ -85,6 +87,8 @@ export const config: Config = {
   GEMINI_MODEL: getEnv("GEMINI_MODEL", false),
   OLLAMA_BASE_URL: getEnv("OLLAMA_BASE_URL", false),
   OLLAMA_MODEL: getEnv("OLLAMA_MODEL", false),
+  SENTRY_DSN: getEnv("SENTRY_DSN", false),
+  HEALTH_CHECK_PORT: Number(process.env.HEALTH_CHECK_PORT) || 3000,
   NODE_ENV: nodeEnv,
   MAX_QUESTIONS_PER_TEST: parseNumber("MAX_QUESTIONS_PER_TEST"),
   MAX_FILE_SIZE_MB: parseNumber("MAX_FILE_SIZE_MB"),

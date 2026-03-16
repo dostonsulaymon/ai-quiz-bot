@@ -189,6 +189,10 @@ export const parseQuestionsResponse = (raw: string): Question[] => {
     .map((item, index) => sanitizeQuestion(item, index))
     .filter((item): item is Question => item !== null);
 
+  if (parsed.length === 0) {
+    return [];
+  }
+
   if (sanitized.length === 0) {
     throw new AIError("AI provider returned an invalid question array", parsed);
   }

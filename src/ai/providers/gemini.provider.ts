@@ -66,7 +66,10 @@ export class GeminiProvider implements IAIProvider {
       });
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
-        throw new AIError("Gemini request timed out", { timeoutMs: config.AI_TIMEOUT_MS }, false);
+        throw new AIError("Gemini request timed out", {
+          code: "TIMEOUT",
+          details: { timeoutMs: config.AI_TIMEOUT_MS }
+        });
       }
       throw error;
     } finally {
@@ -76,6 +79,12 @@ export class GeminiProvider implements IAIProvider {
     const payload = (await response.json()) as GeminiResponse;
 
     if (!response.ok) {
+      if (response.status === 429) {
+        throw new AIError("Gemini rate limit reached", {
+          code: "RATE_LIMIT",
+          details: payload
+        });
+      }
       throw new AppError(payload.error?.message ?? "Gemini request failed", response.status, payload);
     }
 

@@ -48,6 +48,7 @@ export async function generateWithFallback(
 ): Promise<Question[]> {
   const providers = getAIProviders();
   let notifiedFallback = false;
+  let lastAIError: AIError | null = null;
 
   for (let i = 0; i < providers.length; i++) {
     const provider = providers[i]!;
@@ -72,16 +73,25 @@ export async function generateWithFallback(
         error: error instanceof Error ? error.message : String(error)
       });
 
-      if (error instanceof AIError && !error.isRetryable) {
-        throw error;
+      if (error instanceof AIError) {
+        lastAIError = error;
+        if (!error.isRetryable) {
+          throw error;
+        }
       }
       // Retryable — continue to next provider
     }
   }
 
+  if (providers.length === 1 && lastAIError) {
+    throw lastAIError;
+  }
+
   throw new AIError(
     "All AI providers failed. Please try again later.",
-    "ALL_PROVIDERS_FAILED",
-    false
+    {
+      code: "ALL_PROVIDERS_FAILED",
+      details: lastAIError?.details
+    }
   );
 }
