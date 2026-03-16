@@ -1,15 +1,29 @@
 import type { Types } from "mongoose";
 import { GroupSessionModel, type GroupSessionDocument } from "../models/group-session.model.js";
+import { ValidationError } from "../../shared/errors/ValidationError.js";
 
 type CreateGroupSessionInput = {
   chatId: string;
   testId: string | Types.ObjectId;
   startedBy: string;
+  hostLanguage?: string;
 };
 
 export class GroupSessionRepository {
   async create(input: CreateGroupSessionInput): Promise<GroupSessionDocument> {
-    return GroupSessionModel.create(input);
+    try {
+      return await GroupSessionModel.create(input);
+    } catch (error: unknown) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        (error as { code: number }).code === 11000
+      ) {
+        throw new ValidationError("A quiz is already running in this group.", "GROUP_SESSION_ACTIVE");
+      }
+      throw error;
+    }
   }
 
   async findActiveByChat(chatId: string): Promise<GroupSessionDocument | null> {
@@ -26,21 +40,31 @@ export class GroupSessionRepository {
     userId: string,
     firstName: string,
     answer: string,
-    isCorrect: boolean
+    isCorrect: boolean,
+    username?: string
   ): Promise<boolean> {
+    const answerDoc = { questionId, userId, firstName, answer, isCorrect, ...(username !== undefined ? { username } : {}) };
     const result = await GroupSessionModel.findOneAndUpdate(
       {
         _id: sessionId,
         status: "active",
         answers: { $not: { $elemMatch: { questionId, userId } } }
       },
-      { $push: { answers: { questionId, userId, firstName, answer, isCorrect } } }
+      { $push: { answers: answerDoc } }
     ).exec();
     return result !== null;
   }
 
   async setQuestionMessageId(sessionId: string | Types.ObjectId, messageId: number): Promise<void> {
     await GroupSessionModel.updateOne({ _id: sessionId }, { $set: { questionMessageId: messageId } }).exec();
+  }
+
+  async setQuestionSentAt(sessionId: string | Types.ObjectId, sentAt: Date): Promise<void> {
+    await GroupSessionModel.updateOne({ _id: sessionId }, { $set: { questionSentAt: sentAt } }).exec();
+  }
+
+  async findAllActive(): Promise<GroupSessionDocument[]> {
+    return GroupSessionModel.find({ status: "active" }).exec();
   }
 
   async advance(sessionId: string | Types.ObjectId): Promise<GroupSessionDocument | null> {
@@ -61,5 +85,14 @@ export class GroupSessionRepository {
 
   async completeByChat(chatId: string): Promise<void> {
     await GroupSessionModel.updateMany({ chatId, status: "active" }, { $set: { status: "completed" } }).exec();
+  }
+
+  async abandonStaleSessions(olderThanMs: number): Promise<number> {
+    const cutoff = new Date(Date.now() - olderThanMs);
+    const result = await GroupSessionModel.updateMany(
+      { status: "active", startedAt: { $lt: cutoff } },
+      { $set: { status: "completed" } }
+    ).exec();
+    return result.modifiedCount;
   }
 }

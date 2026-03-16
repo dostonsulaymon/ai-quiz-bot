@@ -15,6 +15,10 @@ const leaderboardEntrySchema = new Schema({
     type: String,
     required: true
   },
+  username: {
+    type: String,
+    required: false
+  },
   score: {
     type: Number,
     required: true

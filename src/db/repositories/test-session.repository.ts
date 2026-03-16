@@ -2,6 +2,15 @@ import type { Types } from "mongoose";
 import type { QuestionAnswer, TestSessionStatus } from "../../shared/types/index.js";
 import { TestSessionModel, type TestSessionDocument } from "../models/test-session.model.js";
 
+export type UserStats = {
+  totalTests: number;
+  totalQuestions: number;
+  totalCorrect: number;
+  averageScore: number;
+  bestScore: number;
+  testsThisWeek: number;
+};
+
 type CreateTestSessionInput = {
   testId: string | Types.ObjectId;
   userId: string | Types.ObjectId;
@@ -107,6 +116,46 @@ export class TestSessionRepository {
       status: "abandoned",
       completedAt: new Date()
     }).exec();
+  }
+
+  async getUserStats(userId: Types.ObjectId): Promise<UserStats> {
+    const thisWeek = new Date();
+    thisWeek.setDate(thisWeek.getDate() - 7);
+
+    const [results, testsThisWeek] = await Promise.all([
+      TestSessionModel.aggregate<{
+        totalTests: number;
+        totalQuestions: number;
+        totalCorrect: number;
+        bestScore: number;
+      }>([
+        { $match: { userId, status: "completed" } },
+        {
+          $group: {
+            _id: null,
+            totalTests: { $sum: 1 },
+            totalQuestions: { $sum: "$totalQuestions" },
+            totalCorrect: { $sum: "$correctCount" },
+            bestScore: { $max: "$score" }
+          }
+        }
+      ]).exec(),
+      TestSessionModel.countDocuments({ userId, status: "completed", startedAt: { $gte: thisWeek } }).exec()
+    ]);
+
+    if (results.length === 0) {
+      return { totalTests: 0, totalQuestions: 0, totalCorrect: 0, averageScore: 0, bestScore: 0, testsThisWeek };
+    }
+
+    const r = results[0]!;
+    return {
+      totalTests: r.totalTests,
+      totalQuestions: r.totalQuestions,
+      totalCorrect: r.totalCorrect,
+      averageScore: r.totalQuestions > 0 ? Math.round((r.totalCorrect / r.totalQuestions) * 100) : 0,
+      bestScore: r.bestScore,
+      testsThisWeek
+    };
   }
 
   async countByTestIds(testIds: Types.ObjectId[]): Promise<Map<string, number>> {

@@ -10,17 +10,24 @@ import { ValidationError } from "../../shared/errors/ValidationError.js";
 import type { Question, QuestionAnswer } from "../../shared/types/index.js";
 import type { BotContext, BotSession } from "../types.js";
 import { resetSession } from "../types.js";
+import { transitionTo } from "../state-machine.js";
 import { acquireActiveTestSessionSlot, releaseActiveTestSessionSlot } from "../middlewares/rateLimitMiddleware.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import { LeaderboardRepository } from "../../db/repositories/leaderboard.repository.js";
 import { RedisSessionStorage } from "../storage/redis-session.storage.js";
 import { config } from "../../config/index.js";
+import { safeEditMessageViaApi } from "../utils/telegram.js";
+import { formatQuestionDisplay, formatOptionDisplay } from "../utils/format.js";
 
 const ANSWER_CALLBACK_PREFIX = "test:answer:";
 const SELF_GRADE_CALLBACK_PREFIX = "test:self:";
 const SHARE_CALLBACK = "test:share";
 const RETAKE_CALLBACK = "test:retake";
 const MAIN_MENU_CALLBACK = "test:menu";
+const REVIEW_ANSWERS_CALLBACK = "test:review_answers";
+const REVIEW_ANSWERS_PAGE_PREFIX = "test:review_answers:";
+const REVIEW_BACK_CALLBACK = "test:review_back";
+const REVIEW_PAGE_SIZE = 5;
 export const LEADERBOARD_CALLBACK_PREFIX = "leaderboard:";
 
 const testRepository = new TestRepository();
@@ -84,7 +91,7 @@ const scheduleAutoAdvance = (params: AutoAdvanceParams): void => {
         const updatedText = formatQuestionText(params.question, params.questionIndex, params.totalQuestions, params.lang, params.timeLimitSeconds, remaining);
         try {
           // Omitting reply_markup preserves the existing keyboard on Telegram's end
-          await params.api.editMessageText(params.chatId, params.messageId, updatedText);
+          await safeEditMessageViaApi(params.api, params.chatId, params.messageId, updatedText);
         } catch {
           // Ignore — message may have been answered or deleted
         }
@@ -114,7 +121,7 @@ const runAutoAdvance = async (params: AutoAdvanceParams): Promise<void> => {
   // Edit the question message to show timeout and strip the answer keyboard
   const timedOutText = `${formatQuestionText(question, questionIndex, totalQuestions, lang)}\n\n${t(lang, "test.timeout_auto")}`;
   try {
-    await api.editMessageText(chatId, messageId, timedOutText, { reply_markup: new InlineKeyboard() });
+    await safeEditMessageViaApi(api, chatId, messageId, timedOutText, { reply_markup: new InlineKeyboard() });
   } catch {
     // Ignore — message may have already been edited by a concurrent answer
   }
@@ -229,10 +236,18 @@ const formatQuestionText = (question: Question, index: number, total: number, la
     }
   }
 
-  lines.push("", question.question);
+  const { display: questionDisplay, truncated } = formatQuestionDisplay(question.question);
+  lines.push("", questionDisplay);
+  if (truncated) lines.push(t(lang, "question.truncated_note"));
 
   if (question.type === "mcq" && question.options) {
-    lines.push("", `A. ${question.options.A}`, `B. ${question.options.B}`, `C. ${question.options.C}`, `D. ${question.options.D}`);
+    lines.push(
+      "",
+      `A. ${formatOptionDisplay(question.options.A)}`,
+      `B. ${formatOptionDisplay(question.options.B)}`,
+      `C. ${formatOptionDisplay(question.options.C)}`,
+      `D. ${formatOptionDisplay(question.options.D)}`
+    );
   } else if (question.type === "short" || question.type === "fill") {
     lines.push("", t(lang, "test.typeAnswer"));
   }
@@ -259,6 +274,8 @@ const buildSelfGradeKeyboard = (lang: Language): InlineKeyboard =>
 
 const buildCompletionKeyboard = (lang: Language, testId?: string, showLeaderboard = false): InlineKeyboard => {
   const kb = new InlineKeyboard()
+    .text(t(lang, "test.btn.review_answers"), REVIEW_ANSWERS_CALLBACK)
+    .row()
     .text(t(lang, "test.btn.share"), SHARE_CALLBACK)
     .text(t(lang, "test.btn.retake"), RETAKE_CALLBACK)
     .text(t(lang, "test.btn.mainMenu"), MAIN_MENU_CALLBACK);
@@ -344,7 +361,7 @@ export const enterTestFlow = async (ctx: BotContext, testId: string): Promise<vo
     questions = questions.map(shuffleQuestionOptions);
   }
   ctx.session.testQuestions = questions;
-  ctx.session.state = "testing";
+  transitionTo(ctx.session, "testing", "enterTestFlow");
   ctx.session.testSubState = "answering";
   ctx.session.testCorrectCount = 0;
   ctx.session.currentQuestionIndex = 0;
@@ -467,6 +484,46 @@ const sendCurrentQuestion = async (ctx: BotContext): Promise<void> => {
 };
 
 // ---------------------------------------------------------------------------
+// Timer-expiry helper (handles both restart-recovery and normal timeout path)
+// ---------------------------------------------------------------------------
+
+/**
+ * Called when the per-question timer has already expired before the user answered.
+ * Marks the question wrong, edits the message, and advances to the next question.
+ */
+const handleTimedOutQuestion = async (ctx: BotContext, question: Question, index: number, questions: Question[]): Promise<void> => {
+  const lang = ctx.lang();
+
+  // Cancel any residual visual-countdown timers (best-effort)
+  if (ctx.chat) cancelQuestionTimeout(ctx.chat.id);
+
+  // Answer the callback query if this was triggered by a button press
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery({ text: t(lang, "test.timeout_auto"), show_alert: false }).catch(() => undefined);
+  }
+
+  const sessionId = ctx.session.sessionId;
+  if (sessionId) {
+    await testSessionRepository.updateAnswer(sessionId, {
+      questionId: question.id,
+      userAnswer: "",
+      isCorrect: false
+    } as QuestionAnswer);
+  }
+
+  const messageId = ctx.session.testQuestionMessageId;
+  if (messageId) {
+    const timedOutText = `${formatQuestionText(question, index, questions.length, lang)}\n\n${t(lang, "test.timeout_auto")}`;
+    await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, timedOutText, { reply_markup: new InlineKeyboard() });
+  }
+
+  ctx.session.currentQuestionIndex = index + 1;
+  ctx.session.questionStartedAt = undefined;
+  ctx.session.testQuestionMessageId = undefined;
+  await sendCurrentQuestion(ctx);
+};
+
+// ---------------------------------------------------------------------------
 // Answering sub-state
 // ---------------------------------------------------------------------------
 
@@ -484,6 +541,14 @@ const handleAnswering = async (ctx: BotContext): Promise<void> => {
 
   if (!question) {
     await completeTest(ctx, questions.length);
+    return;
+  }
+
+  // Restart-recovery: startup scan cleared questionStartedAt for already-expired timers.
+  // The sentinel is: testQuestionMessageId set (question was in-flight) but questionStartedAt cleared.
+  const timeLimitSeconds = ctx.session.timeLimitSeconds ?? 0;
+  if (timeLimitSeconds > 0 && ctx.session.testQuestionMessageId !== undefined && ctx.session.questionStartedAt === undefined) {
+    await handleTimedOutQuestion(ctx, question, index, questions);
     return;
   }
 
@@ -549,7 +614,7 @@ const handleChoiceAnswer = async (
 
   const messageId = ctx.session.testQuestionMessageId;
   if (messageId) {
-    await ctx.api.editMessageText(ctx.chatId!, messageId, `${formatQuestionText(question, index, total, lang)}\n\n${feedback}`);
+    await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, `${formatQuestionText(question, index, total, lang)}\n\n${feedback}`);
   }
 
   if (isCorrect) {
@@ -601,7 +666,7 @@ const handleTextAnswer = async (
     const messageId = ctx.session.testQuestionMessageId;
     if (messageId) {
       const feedback = t(lang, "test.timeout", { answer: question.correctAnswer });
-      await ctx.api.editMessageText(ctx.chatId!, messageId, `${formatQuestionText(question, index, questions.length, lang)}\n\n${feedback}`);
+      await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, `${formatQuestionText(question, index, questions.length, lang)}\n\n${feedback}`);
     }
 
     ctx.session.currentQuestionIndex = index + 1;
@@ -729,6 +794,7 @@ const completeTest = async (ctx: BotContext, totalQuestions: number): Promise<vo
 
   // Upsert leaderboard entry and get user rank
   let rankLine: string | undefined;
+  let hintLine: string | undefined;
   let showLeaderboard = false;
   if (activeTestId) {
     try {
@@ -736,6 +802,7 @@ const completeTest = async (ctx: BotContext, totalQuestions: number): Promise<vo
         testId: activeTestId,
         userId: ctx.user._id,
         firstName: ctx.from?.first_name ?? ctx.user.firstName ?? "User",
+        username: ctx.from?.username,
         score,
         correctCount,
         totalQuestions,
@@ -746,9 +813,16 @@ const completeTest = async (ctx: BotContext, totalQuestions: number): Promise<vo
       if (totalParticipants >= 2) {
         rankLine = t(lang, "leaderboard.rank", { rank, total: totalParticipants });
         showLeaderboard = true;
+      } else {
+        hintLine = t(lang, "leaderboard.hint_unlock");
       }
     } catch (error) {
-      logger.error("Leaderboard upsert failed", { event: "leaderboard.upsert.failed", error: error instanceof Error ? error.message : String(error) });
+      logger.error("Leaderboard write failed after test completion — score card will still be shown", {
+        event: "leaderboard.write.failed",
+        userId: ctx.user._id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      // rank and totalParticipants stay at defaults — score card is always shown below
     }
   }
 
@@ -765,6 +839,8 @@ const completeTest = async (ctx: BotContext, totalQuestions: number): Promise<vo
 
   if (rankLine) {
     lines.push("", rankLine);
+  } else if (hintLine) {
+    lines.push("", hintLine);
   }
 
   await ctx.reply(lines.join("\n"), { reply_markup: buildCompletionKeyboard(lang, activeTestId, showLeaderboard) });
@@ -807,6 +883,32 @@ const handleCompleted = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
+  if (data === REVIEW_ANSWERS_CALLBACK || data.startsWith(REVIEW_ANSWERS_PAGE_PREFIX)) {
+    await ctx.answerCallbackQuery();
+    const page = data.startsWith(REVIEW_ANSWERS_PAGE_PREFIX)
+      ? (parseInt(data.slice(REVIEW_ANSWERS_PAGE_PREFIX.length), 10) || 0)
+      : 0;
+    const review = await buildAnswerReviewPage(ctx, lang, page);
+    if (!review) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: true });
+      return;
+    }
+    if (data === REVIEW_ANSWERS_CALLBACK) {
+      // First open: send as new message
+      await ctx.reply(review.text, { reply_markup: review.keyboard });
+    } else {
+      // Navigation: edit the current review message
+      await ctx.editMessageText(review.text, { reply_markup: review.keyboard }).catch(() => undefined);
+    }
+    return;
+  }
+
+  if (data === REVIEW_BACK_CALLBACK) {
+    await ctx.answerCallbackQuery();
+    await ctx.deleteMessage().catch(() => undefined);
+    return;
+  }
+
   if (data.startsWith(LEADERBOARD_CALLBACK_PREFIX)) {
     await ctx.answerCallbackQuery();
     const testId = data.slice(LEADERBOARD_CALLBACK_PREFIX.length);
@@ -824,14 +926,96 @@ const showShareCard = async (ctx: BotContext): Promise<void> => {
   const activeTestId = ctx.session.activeTestId;
   if (!activeTestId) throw new ValidationError("Active test is missing, so the share link cannot be created", "ACTIVE_TEST_MISSING");
 
-  const test = await testRepository.ensureShareCode(activeTestId);
+  const [test, participantCount] = await Promise.all([
+    testRepository.ensureShareCode(activeTestId),
+    leaderboardRepository.getParticipantCount(activeTestId).catch(() => 0)
+  ]);
   if (!test) throw new NotFoundError("Test not found for sharing", "TEST_NOT_FOUND");
 
   const shareCode = `TEST-${test.shareCode}`;
   const username = ctx.me.username ?? "your_bot";
   const link = `https://t.me/${username}?start=${shareCode}`;
 
+  const challengeLine =
+    participantCount === 0
+      ? t(lang, "share.challenge_first")
+      : participantCount === 1
+      ? t(lang, "share.challenge_one")
+      : t(lang, "share.challenge_many", { count: participantCount });
+
   logger.info("Test share code generated", { event: "test.share.generated", userId: ctx.from?.id, testId: activeTestId, shareCode });
 
-  await ctx.reply(t(lang, "test.shareCard", { code: shareCode, link }), { reply_markup: buildShareKeyboard(link, lang) });
+  const instructions = t(lang, "share.instructions", { code: shareCode, link });
+  await ctx.reply(
+    `${t(lang, "test.shareCard", { instructions })}\n\n${challengeLine}`,
+    { reply_markup: buildShareKeyboard(link, lang) }
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Answer review
+// ---------------------------------------------------------------------------
+
+type AnswerReviewPage = { text: string; keyboard: InlineKeyboard };
+
+const buildAnswerReviewPage = async (
+  ctx: BotContext,
+  lang: Language,
+  page: number
+): Promise<AnswerReviewPage | null> => {
+  const sessionId = ctx.session.sessionId;
+  const activeTestId = ctx.session.activeTestId;
+
+  if (!sessionId || !activeTestId) return null;
+
+  const [session, test] = await Promise.all([
+    testSessionRepository.findByIdWithTest(sessionId),
+    testRepository.findById(activeTestId)
+  ]);
+
+  if (!session || !test) return null;
+
+  const answers = session.answers as Array<{ questionId: string; userAnswer: string; isCorrect: boolean; selfGraded?: boolean }>;
+  const questions = test.questions as Array<{ id: string; question: string; correctAnswer: string; type: string }>;
+
+  // Build a lookup from questionId → question
+  const questionMap = new Map(questions.map((q) => [q.id, q]));
+
+  // Pair answers with their questions in order
+  const pairs = answers.map((a) => ({ answer: a, question: questionMap.get(a.questionId) }));
+
+  const totalPages = Math.max(1, Math.ceil(pairs.length / REVIEW_PAGE_SIZE));
+  const safePage = Math.min(Math.max(0, page), totalPages - 1);
+  const slice = pairs.slice(safePage * REVIEW_PAGE_SIZE, (safePage + 1) * REVIEW_PAGE_SIZE);
+
+  const SEP = "━━━━━━━━━━━━━━━━";
+  const correctCount = answers.filter((a) => a.isCorrect).length;
+  const lines: string[] = [t(lang, "test.review.title", { correct: correctCount, total: answers.length })];
+
+  for (let i = 0; i < slice.length; i++) {
+    const { answer, question } = slice[i]!;
+    const globalN = safePage * REVIEW_PAGE_SIZE + i + 1;
+    const qText = question ? (question.question.length > 100 ? `${question.question.slice(0, 100)}…` : question.question) : `[Q${globalN}]`;
+
+    let statusLine: string;
+    if (answer.selfGraded !== undefined) {
+      statusLine = answer.isCorrect ? t(lang, "test.review.self_correct") : t(lang, "test.review.self_wrong");
+    } else if (answer.isCorrect) {
+      statusLine = t(lang, "test.review.correct", { answer: answer.userAnswer });
+    } else {
+      const correct = question?.correctAnswer ?? "?";
+      statusLine = t(lang, "test.review.wrong", { answer: answer.userAnswer, correct });
+    }
+
+    lines.push("", SEP, `Q${globalN}: ${qText}`, statusLine);
+  }
+  lines.push(SEP);
+
+  const kb = new InlineKeyboard();
+  if (safePage > 0) kb.text("◀", `${REVIEW_ANSWERS_PAGE_PREFIX}${safePage - 1}`);
+  if (totalPages > 1) kb.text(`${safePage + 1}/${totalPages}`, REVIEW_ANSWERS_CALLBACK);
+  if (safePage < totalPages - 1) kb.text("▶", `${REVIEW_ANSWERS_PAGE_PREFIX}${safePage + 1}`);
+  kb.row().text(t(lang, "test.review.btn.back"), REVIEW_BACK_CALLBACK);
+
+  return { text: lines.join("\n"), keyboard: kb };
 };

@@ -3,6 +3,7 @@ import { AIError } from "../../shared/errors/AIError.js";
 import { logger } from "../../shared/logger.js";
 import { ValidationError } from "../../shared/errors/ValidationError.js";
 import type { GenerateQuestionsInput, Question, QuestionType } from "../../shared/types/index.js";
+import { normalizeWhitespace } from "../../bot/utils/format.js";
 
 const questionSchemaDescription = `[
   {
@@ -79,6 +80,41 @@ const assertQuestion = (value: unknown): value is Question => {
   return true;
 };
 
+const normalizeQuestionIds = (questions: Question[]): Question[] => {
+  const seen = new Set<string>();
+  return questions.map((q, index) => {
+    // Assign a fallback ID if missing or empty
+    let id = q.id && q.id.trim() ? q.id : `q_${index}_${Date.now()}`;
+
+    if (seen.has(id)) {
+      let newId = `${id}_${Math.random().toString(36).slice(2, 6)}`;
+      while (seen.has(newId)) {
+        newId = `${id}_${Math.random().toString(36).slice(2, 6)}`;
+      }
+      id = newId;
+    }
+
+    seen.add(id);
+    return id === q.id ? q : { ...q, id };
+  });
+};
+
+const normalizeQuestionTexts = (questions: Question[]): Question[] =>
+  questions.map((q) => ({
+    ...q,
+    question: normalizeWhitespace(q.question),
+    correctAnswer: normalizeWhitespace(q.correctAnswer),
+    explanation: q.explanation ? normalizeWhitespace(q.explanation) : q.explanation,
+    options: q.options
+      ? {
+          A: normalizeWhitespace(q.options.A),
+          B: normalizeWhitespace(q.options.B),
+          C: normalizeWhitespace(q.options.C),
+          D: normalizeWhitespace(q.options.D)
+        }
+      : undefined
+  }));
+
 export const parseQuestionsResponse = (raw: string): Question[] => {
   let parsed: unknown;
 
@@ -97,7 +133,7 @@ export const parseQuestionsResponse = (raw: string): Question[] => {
     throw new AIError("AI provider returned an invalid question array", parsed);
   }
 
-  return parsed;
+  return normalizeQuestionTexts(normalizeQuestionIds(parsed));
 };
 
 export const extractTextFromInput = async (input: GenerateQuestionsInput): Promise<string> => {

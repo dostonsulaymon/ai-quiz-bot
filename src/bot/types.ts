@@ -6,7 +6,7 @@ import type { Language } from "../shared/i18n/index.js";
 
 export type BotSessionState = "idle" | "uploading" | "configuring" | "reviewing" | "testing" | "done" | "editing";
 
-export type UploadStep = "waiting_file" | "waiting_count" | "waiting_count_custom" | "waiting_types" | "waiting_shuffle" | "waiting_timer" | "waiting_action";
+export type UploadStep = "waiting_file" | "waiting_text" | "waiting_count" | "waiting_count_custom" | "waiting_types" | "waiting_shuffle" | "waiting_timer" | "waiting_title" | "waiting_action";
 
 export type ReviewSubState = "idle" | "editing_answer";
 
@@ -36,7 +36,8 @@ export type TestSubState = "answering" | "self_grading" | "completed";
 export type UploadedFile = {
   type: "pdf" | "image";
   fileId: string;
-  base64?: string;
+  /** Redis key where the base64 content is stored (short-lived, TTL 1 hour). */
+  storageKey: string;
   /** Actual MIME type of the image (e.g. "image/jpeg", "image/png"). Absent for PDFs. */
   mimeType?: string;
 };
@@ -46,7 +47,7 @@ export type BotSession = {
   language?: Language;
   sessionRecovered?: boolean;
   uploadedFiles?: UploadedFile[];
-  uploadSourceType?: "pdf" | "images";
+  uploadSourceType?: "pdf" | "images" | "text";
   shuffleQuestions?: boolean;
   shuffleOptions?: boolean;
   questionCount?: number;
@@ -58,6 +59,7 @@ export type BotSession = {
   sessionId?: string;
   activeTestSlotId?: string;
   pendingJoinCode?: string;
+  uploadedText?: string;
   // Upload sub-state
   uploadStep?: UploadStep;
   uploadTypesMessageId?: number;
@@ -85,6 +87,8 @@ export type BotSession = {
   editingMessageId?: number;
   editingQuestionSubState?: EditingQuestionSubState;
   editingNewQuestion?: EditingNewQuestion;
+  // Onboarding
+  awaitingLangForWelcome?: boolean;
 };
 
 export type BotContext = Context &
@@ -93,6 +97,10 @@ export type BotContext = Context &
     redis: Redis;
     /** Returns the resolved UI language for this user. Always call after userMiddleware. */
     lang: () => Language;
+    /** True when the user document was created in this request (first-ever interaction). */
+    isNewUser?: boolean;
+    /** True when /start should show a language selection prompt before the welcome screen. */
+    shouldPromptLanguage?: boolean;
   };
 
 export const createInitialSession = (): BotSession => ({
@@ -100,6 +108,7 @@ export const createInitialSession = (): BotSession => ({
   language: undefined,
   sessionRecovered: undefined,
   uploadedFiles: undefined,
+  uploadedText: undefined,
   uploadSourceType: undefined,
   shuffleQuestions: undefined,
   shuffleOptions: undefined,
@@ -134,7 +143,8 @@ export const createInitialSession = (): BotSession => ({
   editingQuestionIndex: undefined,
   editingMessageId: undefined,
   editingQuestionSubState: undefined,
-  editingNewQuestion: undefined
+  editingNewQuestion: undefined,
+  awaitingLangForWelcome: undefined
 });
 
 export const resetSession = (session: BotSession): BotSession => {

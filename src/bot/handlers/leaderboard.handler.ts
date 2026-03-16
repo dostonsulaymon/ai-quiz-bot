@@ -25,7 +25,8 @@ const renderRow = (entry: LeaderboardEntry, position: number, isUser: boolean, s
   const timePart = showTime ? ` — ${formatTime(entry.timeTakenSeconds)}` : "";
   const scorePart = `${entry.score}% (${entry.correctCount}/${entry.totalQuestions})`;
   const prefix = isUser ? "→ " : "";
-  return `${prefix}${medal} ${entry.firstName} — ${scorePart}${timePart}`;
+  const displayName = entry.username ? `@${entry.username}` : entry.firstName;
+  return `${prefix}${medal} ${displayName} — ${scorePart}${timePart}`;
 };
 
 export const renderLeaderboard = async (
@@ -46,10 +47,6 @@ export const renderLeaderboard = async (
 
   if (totalParticipants === 0) {
     return { text: [...header, t(lang, "leaderboard.empty"), SEPARATOR].join("\n") };
-  }
-
-  if (totalParticipants === 1) {
-    return { text: [...header, t(lang, "leaderboard.one_participant"), SEPARATOR].join("\n") };
   }
 
   const topEntries = await leaderboardRepository.getTopEntries(testId, TOP_COUNT);

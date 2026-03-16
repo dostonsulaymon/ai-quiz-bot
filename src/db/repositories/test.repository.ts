@@ -2,6 +2,7 @@ import { customAlphabet } from "nanoid";
 import type { Types } from "mongoose";
 import type { Question, TestSourceType } from "../../shared/types/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { NotFoundError } from "../../shared/errors/NotFoundError.js";
 import { TestModel, type TestDocument } from "../models/test.model.js";
 
 const createShareCode = customAlphabet("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 6);
@@ -108,11 +109,34 @@ export class TestRepository {
     id: string | Types.ObjectId,
     creatorId: string | Types.ObjectId
   ): Promise<TestDocument | null> {
-    return TestModel.findOne({ _id: id, creatorId, deletedAt: null, isActive: true }).exec();
+    return TestModel.findOne({ _id: id, creatorId, isActive: true }).exec();
   }
 
   async softDelete(id: string | Types.ObjectId): Promise<TestDocument | null> {
     return TestModel.findByIdAndUpdate(id, { isActive: false }, { new: true }).exec();
+  }
+
+  async duplicate(
+    testId: string | Types.ObjectId,
+    creatorId: Types.ObjectId,
+    newTitle: string
+  ): Promise<TestDocument> {
+    const original = await TestModel.findById(testId).exec();
+    if (!original) throw new NotFoundError("Test not found", "TEST_NOT_FOUND");
+
+    const copy = new TestModel({
+      title: newTitle,
+      questions: original.questions.map((q) => ({ ...q.toObject() })),
+      creatorId,
+      sourceType: original.sourceType,
+      questionCount: original.questionCount,
+      shuffleQuestions: original.shuffleQuestions,
+      shuffleOptions: original.shuffleOptions,
+      timeLimitSeconds: original.timeLimitSeconds,
+      isActive: true
+    });
+
+    return copy.save();
   }
 
   async updateTest(

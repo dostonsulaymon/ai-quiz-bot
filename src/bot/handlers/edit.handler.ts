@@ -3,8 +3,10 @@ import { TestRepository } from "../../db/repositories/test.repository.js";
 import { LeaderboardRepository } from "../../db/repositories/leaderboard.repository.js";
 import { logger } from "../../shared/logger.js";
 import { resetSession, type BotContext, type EditingNewQuestion } from "../types.js";
+import { transitionTo } from "../state-machine.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import type { Question, QuestionType } from "../../shared/types/index.js";
+import { safeEditMessageViaApi } from "../utils/telegram.js";
 
 // ---------------------------------------------------------------------------
 // Callback data constants
@@ -137,7 +139,7 @@ export const enterEditFlow = async (ctx: BotContext, testId: string): Promise<vo
     return;
   }
 
-  ctx.session.state = "editing";
+  transitionTo(ctx.session, "editing", "enterEditFlow");
   ctx.session.editingTestId = testId;
   ctx.session.editingDraft = test.questions as Question[];
   ctx.session.editingTitle = test.title ?? undefined;
@@ -392,8 +394,8 @@ const handleQuestionsIdle = async (ctx: BotContext): Promise<void> => {
     const nextIndex = index === 0 ? questions.length - 1 : index - 1;
     ctx.session.editingQuestionIndex = nextIndex;
     if (messageId) {
-      await ctx.api.editMessageText(
-        ctx.chatId!, messageId,
+      await safeEditMessageViaApi(
+        ctx.api, ctx.chatId!, messageId,
         formatQuestionCard(questions[nextIndex]!, nextIndex, questions.length, lang),
         { reply_markup: buildQuestionCardKeyboard(nextIndex, questions.length, lang) }
       );
@@ -406,8 +408,8 @@ const handleQuestionsIdle = async (ctx: BotContext): Promise<void> => {
     const nextIndex = (index + 1) % questions.length;
     ctx.session.editingQuestionIndex = nextIndex;
     if (messageId) {
-      await ctx.api.editMessageText(
-        ctx.chatId!, messageId,
+      await safeEditMessageViaApi(
+        ctx.api, ctx.chatId!, messageId,
         formatQuestionCard(questions[nextIndex]!, nextIndex, questions.length, lang),
         { reply_markup: buildQuestionCardKeyboard(nextIndex, questions.length, lang) }
       );
@@ -445,7 +447,7 @@ const handleQuestionsIdle = async (ctx: BotContext): Promise<void> => {
       ctx.session.editingQuestionSubState = "adding_type";
       ctx.session.editingNewQuestion = { id: generateQuestionId() };
       if (messageId) {
-        await ctx.api.editMessageText(ctx.chatId!, messageId, t(lang, "review.noQuestionsRemain")).catch(() => undefined);
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, t(lang, "review.noQuestionsRemain"));
       }
       await ctx.reply(t(lang, "edit.add.type_prompt"), { reply_markup: buildAddTypeKeyboard(lang) });
       return;
@@ -454,8 +456,8 @@ const handleQuestionsIdle = async (ctx: BotContext): Promise<void> => {
     const nextIndex = Math.min(index, questions.length - 1);
     ctx.session.editingQuestionIndex = nextIndex;
     if (messageId) {
-      await ctx.api.editMessageText(
-        ctx.chatId!, messageId,
+      await safeEditMessageViaApi(
+        ctx.api, ctx.chatId!, messageId,
         formatQuestionCard(questions[nextIndex]!, nextIndex, questions.length, lang),
         { reply_markup: buildQuestionCardKeyboard(nextIndex, questions.length, lang) }
       );
@@ -515,8 +517,8 @@ const handleEditingAnswer = async (ctx: BotContext): Promise<void> => {
 
   const messageId = ctx.session.editingMessageId;
   if (messageId) {
-    await ctx.api.editMessageText(
-      ctx.chatId!, messageId,
+    await safeEditMessageViaApi(
+      ctx.api, ctx.chatId!, messageId,
       formatQuestionCard(question, index, questions.length, lang),
       { reply_markup: buildQuestionCardKeyboard(index, questions.length, lang) }
     );

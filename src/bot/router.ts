@@ -4,6 +4,7 @@ import { reviewRouter, enterReviewFlow } from "./handlers/review.handler.js";
 import { testRouter, enterTestFlow } from "./handlers/test.handler.js";
 import { editRouter } from "./handlers/edit.handler.js";
 import { resetSession } from "./types.js";
+import { VALID_TRANSITIONS } from "./state-machine.js";
 import { t } from "../shared/i18n/index.js";
 
 /**
@@ -18,6 +19,11 @@ export const stateRouter = async (ctx: BotContext, next: () => Promise<void>): P
   }
 
   const state = ctx.session.state;
+
+  // Dev-mode guard: catch corrupted or unknown session states before dispatching.
+  if (process.env.NODE_ENV !== "production" && !(state in VALID_TRANSITIONS)) {
+    throw new Error(`[state-machine] Unknown session state "${state}" encountered in stateRouter`);
+  }
 
   if (state === "uploading" || state === "configuring") {
     await uploadRouterFull(ctx);

@@ -1,9 +1,11 @@
 import { InlineKeyboard, type Bot } from "grammy";
 import type { BotContext } from "../types.js";
 import { TestSessionRepository } from "../../db/repositories/test-session.repository.js";
+import { LeaderboardRepository } from "../../db/repositories/leaderboard.repository.js";
 import type { Question } from "../../shared/types/index.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import { formatDate } from "../utils/format.js";
+import { safeEditMessage } from "../utils/telegram.js";
 
 const HISTORY_PAGE_SIZE = 10;
 const HISTORY_PAGE_CALLBACK_PREFIX = "history:page:";
@@ -12,6 +14,7 @@ const HISTORY_BACK_CALLBACK_PREFIX = "history:back:";
 const HISTORY_NOOP_CALLBACK = "history:noop";
 
 const testSessionRepository = new TestSessionRepository();
+const leaderboardRepository = new LeaderboardRepository();
 
 const buildPaginationRow = (page: number, totalPages: number, prefix: string, lang: Language): InlineKeyboard =>
   new InlineKeyboard()
@@ -75,6 +78,7 @@ const renderHistoryDetails = async (
   }
 
   const test = session.testId as {
+    _id?: import("mongoose").Types.ObjectId;
     title?: string;
     questions?: Question[];
   } | null;
@@ -97,6 +101,16 @@ const renderHistoryDetails = async (
     ].join("\n");
   });
 
+  const keyboard = new InlineKeyboard().text(t(lang, "history.btn.back"), `${HISTORY_BACK_CALLBACK_PREFIX}${page}`);
+
+  if (test._id) {
+    const testId = String(test._id);
+    const participantCount = await leaderboardRepository.getParticipantCount(testId);
+    if (participantCount >= 2) {
+      keyboard.row().text(t(lang, "leaderboard.btn"), `leaderboard:${testId}`);
+    }
+  }
+
   return {
     text: [
       `📝 ${test?.title?.trim() || t(lang, "common.untitled")}`,
@@ -105,12 +119,16 @@ const renderHistoryDetails = async (
       "",
       ...breakdown
     ].join("\n\n"),
-    keyboard: new InlineKeyboard().text(t(lang, "history.btn.back"), `${HISTORY_BACK_CALLBACK_PREFIX}${page}`)
+    keyboard
   };
 };
 
 export const registerHistoryHandler = (bot: Bot<BotContext>): void => {
   bot.command("history", async (ctx) => {
+    if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
+      await ctx.reply(t(ctx.lang(), "cmd.private_only"));
+      return;
+    }
     const lang = ctx.lang();
     if (!ctx.user) {
       await ctx.reply(t(lang, "error.userLoad"));
@@ -148,7 +166,7 @@ export const registerHistoryHandler = (bot: Bot<BotContext>): void => {
 
     const { text, keyboard } = await renderHistoryPage(String(ctx.user._id), page, lang);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(new RegExp(`^${HISTORY_DETAILS_CALLBACK_PREFIX}`), async (ctx) => {
@@ -169,7 +187,7 @@ export const registerHistoryHandler = (bot: Bot<BotContext>): void => {
       return;
     }
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(result.text, { reply_markup: result.keyboard });
+    await safeEditMessage(ctx, result.text, { reply_markup: result.keyboard });
   });
 
   bot.callbackQuery(new RegExp(`^${HISTORY_BACK_CALLBACK_PREFIX}`), async (ctx) => {
@@ -182,7 +200,7 @@ export const registerHistoryHandler = (bot: Bot<BotContext>): void => {
     const page = Number(ctx.callbackQuery.data.slice(HISTORY_BACK_CALLBACK_PREFIX.length));
     const { text, keyboard } = await renderHistoryPage(String(ctx.user._id), page, lang);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(HISTORY_NOOP_CALLBACK, async (ctx) => {

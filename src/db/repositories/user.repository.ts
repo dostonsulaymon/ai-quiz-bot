@@ -8,6 +8,7 @@ type UpdateUserSettingsInput = {
   defaultQuestionTypes?: QuestionType[];
   defaultQuestionCount?: number;
   language?: string;
+  languagePrompted?: boolean;
 };
 
 export class UserRepository {
@@ -31,6 +32,10 @@ export class UserRepository {
 
   async findById(id: string | Types.ObjectId): Promise<UserDocument | null> {
     return UserModel.findById(id).exec();
+  }
+
+  async findByTelegramId(telegramId: number): Promise<UserDocument | null> {
+    return UserModel.findOne({ telegramId }).exec();
   }
 
   async updateSettings(id: string | Types.ObjectId, updates: UpdateUserSettingsInput): Promise<UserDocument | null> {

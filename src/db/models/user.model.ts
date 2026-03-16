@@ -34,6 +34,10 @@ const userSchema = new Schema(
       type: String,
       enum: ["en", "uz"],
       default: "en"
+    },
+    languagePrompted: {
+      type: Boolean,
+      default: false
     }
   },
   {

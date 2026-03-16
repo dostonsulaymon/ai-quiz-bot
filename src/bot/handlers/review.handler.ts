@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import { getAIProvider } from "../../ai/ai.factory.js";
+import { generateWithFallback } from "../../ai/ai.factory.js";
 import { TestRepository } from "../../db/repositories/test.repository.js";
 import { AppError } from "../../shared/errors/AppError.js";
 import { logger } from "../../shared/logger.js";
@@ -8,7 +8,11 @@ import { assertGenerationRateLimit } from "../middlewares/rateLimitMiddleware.js
 import type { GenerateQuestionsInput, Question, QuestionType, TestSourceType } from "../../shared/types/index.js";
 import type { BotContext, UploadedFile } from "../types.js";
 import { resetSession } from "../types.js";
+import { transitionTo } from "../state-machine.js";
+import { getUploadData, deleteAllUploadData } from "../utils/upload-storage.js";
 import { t, type Language } from "../../shared/i18n/index.js";
+import { safeEditMessageViaApi } from "../utils/telegram.js";
+import { formatQuestionDisplay, formatOptionDisplay } from "../utils/format.js";
 
 const REVIEW_PREV_CALLBACK = "review:prev";
 const REVIEW_NEXT_CALLBACK = "review:next";
@@ -26,10 +30,18 @@ const testRepository = new TestRepository();
 // ---------------------------------------------------------------------------
 
 const formatQuestionCard = (question: Question, index: number, total: number, lang: Language): string => {
-  const lines = [t(lang, "review.card.header", { n: index + 1, total }), "", question.question];
+  const { display: questionDisplay, truncated } = formatQuestionDisplay(question.question);
+  const lines = [t(lang, "review.card.header", { n: index + 1, total }), "", questionDisplay];
+  if (truncated) lines.push(t(lang, "question.truncated_note"));
 
   if (question.type === "mcq" && question.options) {
-    lines.push("", `A. ${question.options.A}`, `B. ${question.options.B}`, `C. ${question.options.C}`, `D. ${question.options.D}`);
+    lines.push(
+      "",
+      `A. ${formatOptionDisplay(question.options.A)}`,
+      `B. ${formatOptionDisplay(question.options.B)}`,
+      `C. ${formatOptionDisplay(question.options.C)}`,
+      `D. ${formatOptionDisplay(question.options.D)}`
+    );
     lines.push("", t(lang, "review.card.answer", { answer: question.correctAnswer }));
   } else if (question.type === "truefalse") {
     lines.push("", t(lang, "review.card.answer", { answer: question.correctAnswer }));
@@ -71,7 +83,7 @@ export const enterReviewFlow = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
-  ctx.session.state = "reviewing";
+  transitionTo(ctx.session, "reviewing", "enterReviewFlow");
   ctx.session.reviewIndex = 0;
   ctx.session.reviewSubState = "idle";
   ctx.session.reviewEditQuestionIndex = undefined;
@@ -141,7 +153,7 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
       if (draftQuestions.length > 0) {
         const nextIndex = reviewIndex === 0 ? draftQuestions.length - 1 : reviewIndex - 1;
         ctx.session.reviewIndex = nextIndex;
-        await ctx.api.editMessageText(ctx.chatId!, messageId, formatQuestionCard(draftQuestions[nextIndex]!, nextIndex, draftQuestions.length, lang), {
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(draftQuestions[nextIndex]!, nextIndex, draftQuestions.length, lang), {
           reply_markup: buildReviewKeyboard(nextIndex, draftQuestions.length, lang)
         });
       }
@@ -152,7 +164,7 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
       if (draftQuestions.length > 0) {
         const nextIndex = (reviewIndex + 1) % draftQuestions.length;
         ctx.session.reviewIndex = nextIndex;
-        await ctx.api.editMessageText(ctx.chatId!, messageId, formatQuestionCard(draftQuestions[nextIndex]!, nextIndex, draftQuestions.length, lang), {
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(draftQuestions[nextIndex]!, nextIndex, draftQuestions.length, lang), {
           reply_markup: buildReviewKeyboard(nextIndex, draftQuestions.length, lang)
         });
       }
@@ -192,12 +204,19 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
         questionIndex: reviewIndex
       });
       await ctx.answerCallbackQuery();
-      await ctx.api.editMessageText(ctx.chatId!, messageId, t(lang, "review.regenerating"));
+      await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, t(lang, "review.regenerating"));
 
       try {
         await assertGenerationRateLimit(ctx);
-        const input = buildGenerateInput(ctx.session.uploadedFiles ?? [], 1, [question.type]);
-        const generated = await getAIProvider().generateQuestions(input);
+        const input = await buildInputFromSession(ctx, 1, [question.type]);
+        if (!input) {
+          await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(question, reviewIndex, draftQuestions.length, lang), {
+            reply_markup: buildReviewKeyboard(reviewIndex, draftQuestions.length, lang)
+          });
+          await ctx.reply(t(lang, "upload.expired"));
+          break;
+        }
+        const generated = await generateWithFallback(input);
         const replacement = generated[0];
 
         if (!replacement) {
@@ -208,12 +227,12 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
         ctx.session.draftQuestions = draftQuestions;
 
         logger.info("Review question regeneration succeeded", { event: "review.question.regenerate.success", userId: ctx.from?.id, questionIndex: reviewIndex });
-        await ctx.api.editMessageText(ctx.chatId!, messageId, formatQuestionCard(replacement, reviewIndex, draftQuestions.length, lang), {
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(replacement, reviewIndex, draftQuestions.length, lang), {
           reply_markup: buildReviewKeyboard(reviewIndex, draftQuestions.length, lang)
         });
       } catch (error) {
         logger.error("Review question regeneration failed", { event: "review.question.regenerate.failed", userId: ctx.from?.id, questionIndex: reviewIndex });
-        await ctx.api.editMessageText(ctx.chatId!, messageId, formatQuestionCard(question, reviewIndex, draftQuestions.length, lang), {
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(question, reviewIndex, draftQuestions.length, lang), {
           reply_markup: buildReviewKeyboard(reviewIndex, draftQuestions.length, lang)
         });
         await ctx.answerCallbackQuery({ text: t(lang, "review.regenerationFailedToast"), show_alert: false });
@@ -229,35 +248,36 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
 
       if (draftQuestions.length === 0) {
         ctx.session.reviewIndex = 0;
-        await ctx.api.editMessageText(
-          ctx.chatId!,
-          messageId,
-          t(lang, "review.noQuestionsRemain"),
-          { reply_markup: buildEmptyKeyboard(lang) }
-        );
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, t(lang, "review.noQuestionsRemain"), { reply_markup: buildEmptyKeyboard(lang) });
         break;
       }
 
       const nextIndex = Math.min(reviewIndex, draftQuestions.length - 1);
       ctx.session.reviewIndex = nextIndex;
-      await ctx.api.editMessageText(ctx.chatId!, messageId, formatQuestionCard(draftQuestions[nextIndex]!, nextIndex, draftQuestions.length, lang), {
+      await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(draftQuestions[nextIndex]!, nextIndex, draftQuestions.length, lang), {
         reply_markup: buildReviewKeyboard(nextIndex, draftQuestions.length, lang)
       });
       break;
     }
     case REVIEW_REGENERATE_ALL_CALLBACK: {
       await ctx.answerCallbackQuery();
-      await ctx.api.editMessageText(ctx.chatId!, messageId, t(lang, "review.regenerating"));
+      await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, t(lang, "review.regenerating"));
 
       try {
-        const { uploadedFiles, questionCount, questionTypes } = ctx.session;
-        if (!questionCount || !questionTypes?.length || !uploadedFiles?.length) {
+        const { questionCount, questionTypes } = ctx.session;
+        if (!questionCount || !questionTypes?.length) {
           throw new ValidationError("Missing data required to regenerate questions", "UPLOAD_SESSION_INCOMPLETE");
         }
 
+        const input = await buildInputFromSession(ctx, questionCount, questionTypes);
+        if (!input) {
+          await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, t(lang, "review.noQuestionsRemain"), { reply_markup: buildEmptyKeyboard(lang) });
+          await ctx.reply(t(lang, "upload.expired"));
+          break;
+        }
+
         await assertGenerationRateLimit(ctx);
-        const input = buildGenerateInput(uploadedFiles, questionCount, questionTypes);
-        const regenerated = await getAIProvider().generateQuestions(input);
+        const regenerated = await generateWithFallback(input);
 
         if (regenerated.length === 0) {
           throw new Error("AI returned an empty question list");
@@ -265,17 +285,12 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
 
         ctx.session.draftQuestions = regenerated;
         ctx.session.reviewIndex = 0;
-        await ctx.api.editMessageText(ctx.chatId!, messageId, formatQuestionCard(regenerated[0]!, 0, regenerated.length, lang), {
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(regenerated[0]!, 0, regenerated.length, lang), {
           reply_markup: buildReviewKeyboard(0, regenerated.length, lang)
         });
       } catch (error) {
         logger.error("Review regenerate-all failed", { event: "review.regenerate_all.failed", userId: ctx.from?.id });
-        await ctx.api.editMessageText(
-          ctx.chatId!,
-          messageId,
-          t(lang, "review.noQuestionsRemain"),
-          { reply_markup: buildEmptyKeyboard(lang) }
-        );
+        await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, t(lang, "review.noQuestionsRemain"), { reply_markup: buildEmptyKeyboard(lang) });
         await ctx.reply(t(lang, "review.regenerateAllFailed"));
       }
       break;
@@ -349,7 +364,7 @@ const handleEditingAnswer = async (ctx: BotContext): Promise<void> => {
 
   const messageId = ctx.session.reviewMessageId;
   if (messageId) {
-    await ctx.api.editMessageText(ctx.chatId!, messageId, formatQuestionCard(question, questionIndex, draftQuestions.length, lang), {
+    await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(question, questionIndex, draftQuestions.length, lang), {
       reply_markup: buildReviewKeyboard(questionIndex, draftQuestions.length, lang)
     });
   }
@@ -362,26 +377,66 @@ const handleEditingAnswer = async (ctx: BotContext): Promise<void> => {
 const getSourceType = (ctx: BotContext): TestSourceType =>
   ctx.session.uploadSourceType ?? "images";
 
+type ResolvedFile = UploadedFile & { base64: string };
+
 const buildGenerateInput = (
-  uploadedFiles: UploadedFile[],
+  filesWithData: ResolvedFile[],
   questionCount: number,
   questionTypes: QuestionType[]
 ): GenerateQuestionsInput => {
-  const firstFile = uploadedFiles[0];
+  const firstFile = filesWithData[0];
   if (!firstFile) throw new ValidationError("No uploaded files are available for generation", "UPLOAD_MISSING");
 
   if (firstFile.type === "pdf") {
-    return { content: { type: "pdf", base64: firstFile.base64 ?? "" }, questionCount, questionTypes };
+    return { content: { type: "pdf", base64: firstFile.base64 }, questionCount, questionTypes };
   }
 
   return {
     content: {
       type: "images",
-      images: uploadedFiles.map((file) => ({ base64: file.base64 ?? "", mimeType: file.mimeType ?? "image/jpeg" }))
+      images: filesWithData.map((file) => ({ base64: file.base64, mimeType: file.mimeType ?? "image/jpeg" }))
     },
     questionCount,
     questionTypes
   };
+};
+
+/** Fetches base64 data from Redis for all uploaded files. Returns null if any have expired. */
+const resolveFilesFromRedis = async (
+  ctx: BotContext,
+  uploadedFiles: UploadedFile[]
+): Promise<ResolvedFile[] | null> => {
+  const base64Entries = await Promise.all(uploadedFiles.map((f) => getUploadData(ctx.redis, f.storageKey)));
+  if (base64Entries.some((b) => b === null)) return null;
+  return uploadedFiles.map((file, i) => ({ ...file, base64: base64Entries[i]! }));
+};
+
+/**
+ * Build a GenerateQuestionsInput from the current session.
+ * Returns null if the source data has expired (file TTL) — caller should handle gracefully.
+ * Throws ValidationError if required session fields are missing.
+ */
+const buildInputFromSession = async (
+  ctx: BotContext,
+  questionCount: number,
+  questionTypes: QuestionType[]
+): Promise<GenerateQuestionsInput | null> => {
+  const { uploadSourceType, uploadedText, uploadedFiles } = ctx.session;
+
+  if (uploadSourceType === "text") {
+    if (!uploadedText) {
+      throw new ValidationError("Text source data is missing from session", "UPLOAD_SESSION_INCOMPLETE");
+    }
+    return { content: { type: "text", text: uploadedText }, questionCount, questionTypes };
+  }
+
+  const files = uploadedFiles ?? [];
+  if (files.length === 0) {
+    throw new ValidationError("Source files no longer available for regeneration", "UPLOAD_SESSION_INCOMPLETE");
+  }
+  const filesWithData = await resolveFilesFromRedis(ctx, files);
+  if (!filesWithData) return null; // expired
+  return buildGenerateInput(filesWithData, questionCount, questionTypes);
 };
 
 const saveTestAndTransition = async (ctx: BotContext): Promise<void> => {
@@ -399,8 +454,12 @@ const saveTestAndTransition = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
+  // Delete upload data from Redis — no longer needed after saving the test.
+  await deleteAllUploadData(ctx.redis, uploadedFiles.map((f) => f.storageKey));
+
   const savedTest = await testRepository.create({
     creatorId: ctx.user._id,
+    title: ctx.session.editingTitle ?? t(lang, "test.default_title"),
     questions: draftQuestions,
     sourceType: getSourceType(ctx),
     questionCount: draftQuestions.length,
@@ -412,7 +471,7 @@ const saveTestAndTransition = async (ctx: BotContext): Promise<void> => {
   ctx.session.activeTestId = String(savedTest._id);
   ctx.session.currentQuestionIndex = 0;
   ctx.session.sessionId = undefined;
-  ctx.session.state = "testing";
+  transitionTo(ctx.session, "testing", "saveTestAndTransition");
   ctx.session.testSubState = "answering";
   ctx.session.testCorrectCount = 0;
   ctx.session.reviewMessageId = undefined;

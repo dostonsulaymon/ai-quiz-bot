@@ -11,6 +11,7 @@ type Config = {
   MONGODB_URI: string;
   REDIS_URL: string;
   AI_PROVIDER: AIProviderType;
+  AI_PROVIDER_ORDER: string;
   CLAUDE_API_KEY?: string;
   CLAUDE_MODEL?: string;
   GEMINI_API_KEY?: string;
@@ -24,6 +25,7 @@ type Config = {
   RATE_LIMIT_DAILY_MAX: number;
   AI_TIMEOUT_MS: number;
   SESSION_TTL_SECONDS: number;
+  STALE_GROUP_SESSION_TTL_MS: number;
 };
 
 const PROVIDERS = ["claude", "gemini", "ollama"] as const;
@@ -75,6 +77,7 @@ export const config: Config = {
   MONGODB_URI: getEnv("MONGODB_URI")!,
   REDIS_URL: getEnv("REDIS_URL")!,
   AI_PROVIDER: aiProvider,
+  AI_PROVIDER_ORDER: getEnv("AI_PROVIDER_ORDER", false) ?? "claude,gemini,ollama",
   CLAUDE_API_KEY: getEnv("CLAUDE_API_KEY", false),
   CLAUDE_MODEL: getEnv("CLAUDE_MODEL", false),
   GEMINI_API_KEY: getEnv("GEMINI_API_KEY", false),
@@ -87,5 +90,6 @@ export const config: Config = {
   RATE_LIMIT_GENERATIONS_PER_HOUR: parseNumber("RATE_LIMIT_GENERATIONS_PER_HOUR"),
   RATE_LIMIT_DAILY_MAX: parseNumber("RATE_LIMIT_DAILY_MAX"),
   AI_TIMEOUT_MS: Number(process.env.AI_TIMEOUT_MS) || 60_000,
-  SESSION_TTL_SECONDS: Number(process.env.SESSION_TTL_SECONDS) || 604_800
+  SESSION_TTL_SECONDS: Number(process.env.SESSION_TTL_SECONDS) || 604_800,
+  STALE_GROUP_SESSION_TTL_MS: Number(process.env.STALE_GROUP_SESSION_TTL_MS) || 1_800_000
 };

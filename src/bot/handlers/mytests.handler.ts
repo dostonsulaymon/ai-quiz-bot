@@ -8,6 +8,7 @@ import { enterTestFlow, LEADERBOARD_CALLBACK_PREFIX } from "./test.handler.js";
 import { enterEditFlow } from "./edit.handler.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import { formatDate } from "../utils/format.js";
+import { safeEditMessage } from "../utils/telegram.js";
 
 const MYTESTS_PAGE_SIZE = 5;
 const MYTESTS_PAGE_CALLBACK_PREFIX = "mytests:page:";
@@ -19,6 +20,7 @@ const MYTESTS_TAKE_CALLBACK_PREFIX = "mytests:take:";
 const MYTESTS_PREVIEW_CALLBACK_PREFIX = "mytests:preview:";
 const MYTESTS_BACK_CALLBACK_PREFIX = "mytests:back:";
 const MYTESTS_EDIT_CALLBACK_PREFIX = "mytests:edit:";
+const MYTESTS_DUPLICATE_CALLBACK_PREFIX = "mytests:duplicate:";
 const MYTESTS_NOOP_CALLBACK = "mytests:noop";
 
 const testRepository = new TestRepository();
@@ -45,22 +47,34 @@ const renderMyTestsPage = async (userId: string, page: number, lang: Language): 
   const tests = await testRepository.findByCreatorPaginated(userId, currentPage, MYTESTS_PAGE_SIZE);
   const testIds = tests.map((test) => test._id);
 
-  const [takeCountMap, participantCounts] = await Promise.all([
+  const [takeCountMap, participantCountMap] = await Promise.all([
     testSessionRepository.countByTestIds(testIds),
-    Promise.all(testIds.map((id) => leaderboardRepository.getParticipantCount(id)))
+    leaderboardRepository.getParticipantCounts(testIds)
   ]);
-  const participantCountMap = new Map(testIds.map((id, i) => [String(id), participantCounts[i]!]));
 
-  const lines = tests.flatMap((test, index) => [
-    t(lang, "mytests.testRow", {
-      n: index + 1,
-      title: test.title?.trim() || t(lang, "common.untitled"),
-      q: test.questions.length,
-      types: formatQuestionTypes(test.questions.map((question) => question.type), lang)
-    }),
-    t(lang, "mytests.testRowMeta", { n: takeCountMap.get(String(test._id)) ?? 0, date: formatDate(test.createdAt, false, lang) }),
-    ""
-  ]);
+  const lines = tests.flatMap((test, index) => {
+    const participantCount = participantCountMap.get(String(test._id)) ?? 0;
+    const participantHint =
+      participantCount === 0
+        ? t(lang, "mytests.not_taken")
+        : participantCount === 1
+        ? t(lang, "mytests.one_taken")
+        : undefined;
+
+    const row = [
+      t(lang, "mytests.testRow", {
+        n: index + 1,
+        title: test.title?.trim() || t(lang, "common.untitled"),
+        q: test.questions.length,
+        types: formatQuestionTypes(test.questions.map((question) => question.type), lang)
+      }),
+      t(lang, "mytests.testRowMeta", { n: takeCountMap.get(String(test._id)) ?? 0, date: formatDate(test.createdAt, false, lang) })
+    ];
+
+    if (participantHint) row.push(participantHint);
+    row.push("");
+    return row;
+  });
 
   const keyboard = new InlineKeyboard();
   tests.forEach((test, index) => {
@@ -72,7 +86,8 @@ const renderMyTestsPage = async (userId: string, page: number, lang: Language): 
       .text(t(lang, "mytests.btn.delete"), `${MYTESTS_DELETE_CALLBACK_PREFIX}${testId}:${currentPage}`)
       .row()
       .text(t(lang, "mytests.btn.preview"), `${MYTESTS_PREVIEW_CALLBACK_PREFIX}${testId}:${currentPage}`)
-      .text(t(lang, "mytests.btn.edit"), `${MYTESTS_EDIT_CALLBACK_PREFIX}${testId}`);
+      .text(t(lang, "mytests.btn.edit"), `${MYTESTS_EDIT_CALLBACK_PREFIX}${testId}`)
+      .text(t(lang, "mytests.btn.duplicate"), `${MYTESTS_DUPLICATE_CALLBACK_PREFIX}${testId}:${currentPage}`);
 
     if (participantCount >= 2) {
       keyboard.text(t(lang, "leaderboard.btn"), `${LEADERBOARD_CALLBACK_PREFIX}${testId}`);
@@ -115,8 +130,9 @@ const renderShareView = async (testId: string, page: number, lang: Language, bot
   const code = `TEST-${test.shareCode}`;
   const link = `https://t.me/${botUsername ?? "your_bot"}?start=${code}`;
 
+  const instructions = t(lang, "share.instructions", { code, link });
   return {
-    text: t(lang, "mytests.shareCard", { code, link }),
+    text: t(lang, "mytests.shareCard", { instructions }),
     keyboard: new InlineKeyboard()
       .url(t(lang, "mytests.btn.copyLink"), link)
       .row()
@@ -142,6 +158,10 @@ const startOwnedTest = async (ctx: BotContext, testId: string): Promise<void> =>
 
 export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
   bot.command("mytests", async (ctx) => {
+    if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
+      await ctx.reply(t(ctx.lang(), "cmd.private_only"));
+      return;
+    }
     const lang = ctx.lang();
     if (!ctx.user) {
       await ctx.reply(t(lang, "error.userLoad"));
@@ -179,7 +199,7 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
 
     const { text, keyboard } = await renderMyTestsPage(String(ctx.user._id), page, lang);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(new RegExp(`^${MYTESTS_PREVIEW_CALLBACK_PREFIX}`), async (ctx) => {
@@ -188,7 +208,7 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     const [testId, pageValue] = payload.split(":");
     const { text, keyboard } = await renderPreview(testId ?? "", Number(pageValue ?? "1"), lang);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(new RegExp(`^${MYTESTS_SHARE_CALLBACK_PREFIX}`), async (ctx) => {
@@ -208,7 +228,7 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
 
     const { text, keyboard } = await renderShareView(testId ?? "", Number(pageValue ?? "1"), lang, ctx.me.username);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(/^mytests:delete:[^:]+:\d+$/, async (ctx) => {
@@ -217,7 +237,7 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     const [testId, pageValue] = payload.split(":");
     const { text, keyboard } = await renderDeleteConfirm(testId ?? "", Number(pageValue ?? "1"), lang);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(/^mytests:delete:confirm:[^:]+:\d+$/, async (ctx) => {
@@ -238,7 +258,7 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     await testRepository.softDelete(testId ?? "");
     const { text, keyboard } = await renderMyTestsPage(String(ctx.user._id), Number(pageValue ?? "1"), lang);
     await ctx.answerCallbackQuery({ text: t(lang, "mytests.deleted"), show_alert: false });
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(/^mytests:delete:cancel:\d+$/, async (ctx) => {
@@ -251,7 +271,7 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     const page = Number(ctx.callbackQuery.data.slice(MYTESTS_DELETE_CANCEL_CALLBACK_PREFIX.length));
     const { text, keyboard } = await renderMyTestsPage(String(ctx.user._id), page, lang);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(new RegExp(`^${MYTESTS_BACK_CALLBACK_PREFIX}`), async (ctx) => {
@@ -264,7 +284,7 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     const page = Number(ctx.callbackQuery.data.slice(MYTESTS_BACK_CALLBACK_PREFIX.length));
     const { text, keyboard } = await renderMyTestsPage(String(ctx.user._id), page, lang);
     await ctx.answerCallbackQuery();
-    await ctx.editMessageText(text, { reply_markup: keyboard });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.callbackQuery(new RegExp(`^${MYTESTS_TAKE_CALLBACK_PREFIX}`), async (ctx) => {
@@ -281,5 +301,30 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     const testId = ctx.callbackQuery.data.slice(MYTESTS_EDIT_CALLBACK_PREFIX.length);
     await ctx.answerCallbackQuery();
     await enterEditFlow(ctx, testId);
+  });
+
+  bot.callbackQuery(new RegExp(`^${MYTESTS_DUPLICATE_CALLBACK_PREFIX}`), async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+
+    const payload = ctx.callbackQuery.data.slice(MYTESTS_DUPLICATE_CALLBACK_PREFIX.length);
+    const [testId, pageValue] = payload.split(":");
+    const owned = await testRepository.findByIdAndCreator(testId ?? "", ctx.user._id);
+    if (!owned) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.not_owner"), show_alert: true });
+      return;
+    }
+
+    const originalTitle = owned.title?.trim() || t(lang, "common.untitledTest");
+    const newTitle = `${originalTitle}${t(lang, "mytests.duplicate.title_suffix")}`;
+    const newTest = await testRepository.duplicate(testId ?? "", ctx.user._id, newTitle);
+
+    const page = Number(pageValue ?? "1");
+    const { text, keyboard } = await renderMyTestsPage(String(ctx.user._id), page, lang);
+    await ctx.answerCallbackQuery({ text: t(lang, "mytests.duplicate.success", { title: newTest.title ?? newTitle }), show_alert: false });
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 };

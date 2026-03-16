@@ -6,13 +6,15 @@ import { logger } from "../../shared/logger.js";
 import { registerHistoryHandler } from "./history.handler.js";
 import { registerMyTestsHandler } from "./mytests.handler.js";
 import { registerLeaderboardHandler, renderLeaderboard } from "./leaderboard.handler.js";
-import { registerGroupHandlers, startGroupQuiz, cancelGroupQuiz } from "./group.handler.js";
+import { registerGroupHandlers, startGroupQuiz, cancelGroupQuiz, stopGroupQuiz } from "./group.handler.js";
 import type { BotContext } from "../types.js";
 import { resetSession } from "../types.js";
 import { enterUploadFlow } from "./upload.handler.js";
 import { enterTestFlow } from "./test.handler.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import { TestSessionRepository } from "../../db/repositories/test-session.repository.js";
+import type { UserStats } from "../../db/repositories/test-session.repository.js";
+import { GroupSessionRepository } from "../../db/repositories/group-session.repository.js";
 import { userCache } from "../middlewares/userMiddleware.js";
 
 const commands: BotCommand[] = [
@@ -21,8 +23,10 @@ const commands: BotCommand[] = [
   { command: "join", description: "Join a shared test using a share code" },
   { command: "mytests", description: "List tests you created" },
   { command: "history", description: "View your past test sessions" },
+  { command: "stats", description: "View your overall performance statistics" },
   { command: "leaderboard", description: "View leaderboard for a test by share code" },
   { command: "language", description: "Change language / Tilni o'zgartirish" },
+  { command: "stop", description: "Stop the current group quiz (group chats only)" },
   { command: "cancel", description: "Cancel the current flow and reset progress" },
   { command: "help", description: "Show available commands" }
 ];
@@ -30,10 +34,18 @@ const commands: BotCommand[] = [
 const JOIN_AWAITING_CODE = "__awaiting_join_code__";
 const JOIN_START_CALLBACK_PREFIX = "join:start:";
 const JOIN_CANCEL_CALLBACK = "join:cancel";
+const NEWTEST_CONFIRM_CALLBACK = "newtest:confirm";
+const NEWTEST_CANCEL_CALLBACK = "newtest:cancel";
 const LANG_CALLBACK_PREFIX = "lang:";
+const START_NEWTEST_CALLBACK = "start:newtest";
+const START_JOIN_CALLBACK = "start:join";
+const START_LANGUAGE_CALLBACK = "start:language";
+const START_HELP_CALLBACK = "start:help";
+const START_STATS_CALLBACK = "start:stats";
 const testRepository = new TestRepository();
 const userRepository = new UserRepository();
 const testSessionRepository = new TestSessionRepository();
+const groupSessionRepository = new GroupSessionRepository();
 
 const normalizeShareCode = (value: string | undefined): string | undefined => {
   const code = value?.trim().toUpperCase().replace(/^TEST-/, "");
@@ -60,15 +72,19 @@ const showTestPreview = async (ctx: BotContext, testId: string): Promise<void> =
   const title = test.title?.trim() || t(lang, "common.untitledTest");
   const questionTypes = formatQuestionTypes(test.questions.map((question) => question.type), lang);
 
-  await ctx.reply(
-    [
-      t(lang, "commands.testPreview.title", { title }),
-      t(lang, "commands.testPreview.questions", { n: test.questions.length }),
-      t(lang, "commands.testPreview.types", { types: questionTypes }),
-      t(lang, "commands.testPreview.creator", { creator: creatorLabel })
-    ].join("\n"),
-    { reply_markup: buildPreviewKeyboard(String(test._id), lang) }
-  );
+  const lines = [
+    t(lang, "commands.testPreview.title", { title }),
+    t(lang, "commands.testPreview.questions", { n: test.questions.length }),
+    t(lang, "commands.testPreview.types", { types: questionTypes }),
+    t(lang, "commands.testPreview.creator", { creator: creatorLabel })
+  ];
+
+  // Only show the private-chat note when we're actually in a private chat
+  if (ctx.chat?.type === "private") {
+    lines.push("", t(lang, "join.taking_privately"));
+  }
+
+  await ctx.reply(lines.join("\n"), { reply_markup: buildPreviewKeyboard(String(test._id), lang) });
 };
 
 const previewSharedTest = async (ctx: BotContext, shareCode: string): Promise<void> => {
@@ -79,6 +95,36 @@ const previewSharedTest = async (ctx: BotContext, shareCode: string): Promise<vo
   }
 
   await showTestPreview(ctx, String(test._id));
+};
+
+const buildWelcomeKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "start.btn.newtest"), START_NEWTEST_CALLBACK)
+    .text(t(lang, "start.btn.join"), START_JOIN_CALLBACK)
+    .row()
+    .text(t(lang, "start.btn.stats"), START_STATS_CALLBACK)
+    .row()
+    .text(t(lang, "start.btn.language"), START_LANGUAGE_CALLBACK)
+    .text(t(lang, "start.btn.help"), START_HELP_CALLBACK);
+
+const buildStatsMessage = (stats: UserStats, testsCreated: number, lang: Language): string => {
+  if (stats.totalTests === 0) {
+    return t(lang, "stats.empty");
+  }
+
+  const SEP = t(lang, "test.complete.separator");
+  return [
+    t(lang, "stats.title"),
+    SEP,
+    t(lang, "stats.total_tests", { count: stats.totalTests }),
+    t(lang, "stats.total_questions", { count: stats.totalQuestions }),
+    t(lang, "stats.total_correct", { count: stats.totalCorrect }),
+    t(lang, "stats.average_score", { score: stats.averageScore }),
+    t(lang, "stats.best_score", { score: stats.bestScore }),
+    t(lang, "stats.this_week", { count: stats.testsThisWeek }),
+    SEP,
+    t(lang, "stats.tests_created", { count: testsCreated })
+  ].join("\n");
 };
 
 const buildLanguageKeyboard = (lang: Language): InlineKeyboard =>
@@ -125,14 +171,67 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       return handleJoinByCode(ctx, payload);
     }
 
-    await ctx.reply(t(ctx.lang(), "commands.welcome"));
+    const lang = ctx.lang();
+
+    if (ctx.shouldPromptLanguage) {
+      ctx.session.awaitingLangForWelcome = true;
+      const prompt = `${t("en", "language.auto_prompt")}\n${t("uz", "language.auto_prompt_uz")}`;
+      await ctx.reply(prompt, { reply_markup: buildLanguageKeyboard(lang) });
+      return;
+    }
+
+    const text = ctx.isNewUser
+      ? t(lang, "start.welcome_new", { name: ctx.from?.first_name ?? "" })
+      : t(lang, "start.welcome_returning");
+    await ctx.reply(text, { reply_markup: buildWelcomeKeyboard(lang) });
   });
 
   bot.command("newtest", async (ctx) => {
+    const lang = ctx.lang();
+
+    if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
+      const kb = new InlineKeyboard().url(
+        t(lang, "newtest.open_private_chat"),
+        `https://t.me/${ctx.me.username}`
+      );
+      await ctx.reply(t(lang, "newtest.groups_not_allowed"), { reply_markup: kb });
+      return;
+    }
+
     logger.info("New test command received", {
       event: "command.newtest",
-      userId: ctx.from?.id
+      userId: ctx.from?.id,
+      state: ctx.session.state
     });
+
+    const state = ctx.session.state;
+
+    if (state === "uploading" || state === "configuring") {
+      const kb = new InlineKeyboard()
+        .text(t(lang, "newtest.confirm_yes"), NEWTEST_CONFIRM_CALLBACK)
+        .text(t(lang, "newtest.confirm_no"), NEWTEST_CANCEL_CALLBACK);
+      await ctx.reply(t(lang, "newtest.confirm_reset_upload"), { reply_markup: kb });
+      return;
+    }
+
+    if (state === "reviewing") {
+      const kb = new InlineKeyboard()
+        .text(t(lang, "newtest.confirm_yes"), NEWTEST_CONFIRM_CALLBACK)
+        .text(t(lang, "newtest.confirm_no"), NEWTEST_CANCEL_CALLBACK);
+      await ctx.reply(t(lang, "newtest.confirm_reset_review"), { reply_markup: kb });
+      return;
+    }
+
+    if (state === "testing") {
+      const answered = ctx.session.currentQuestionIndex ?? 0;
+      const correct = ctx.session.testCorrectCount ?? 0;
+      const kb = new InlineKeyboard()
+        .text(t(lang, "newtest.confirm_yes"), NEWTEST_CONFIRM_CALLBACK)
+        .text(t(lang, "newtest.confirm_no"), NEWTEST_CANCEL_CALLBACK);
+      await ctx.reply(t(lang, "newtest.confirm_reset_test", { answered, correct }), { reply_markup: kb });
+      return;
+    }
+
     await enterUploadFlow(ctx);
   });
 
@@ -161,6 +260,15 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
         await ctx.reply(t(ctx.lang(), "commands.testLinkInvalid"));
         return;
       }
+      const lang = ctx.lang();
+      const title = test.title?.trim() || t(lang, "common.untitledTest");
+      await ctx.reply(
+        t(lang, "join.group_starting", {
+          name: ctx.from?.first_name ?? "Someone",
+          title,
+          count: test.questions.length
+        })
+      );
       await startGroupQuiz(ctx, String(test._id));
       return;
     }
@@ -180,10 +288,17 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       userId: ctx.from?.id
     });
 
-    // In group chats, /cancel ends the active group quiz
+    // In group chats, /cancel ends the active group quiz (host-only)
     const chatType = ctx.chat?.type;
     if (chatType === "group" || chatType === "supergroup") {
-      await cancelGroupQuiz(String(ctx.chat!.id));
+      const session = await groupSessionRepository.findActiveByChat(String(ctx.chat!.id));
+      if (session) {
+        if (ctx.from?.id !== Number(session.startedBy)) {
+          await ctx.reply(t(ctx.lang(), "group.stop_host_only"));
+          return;
+        }
+        await cancelGroupQuiz(String(ctx.chat!.id));
+      }
       await ctx.reply(t(ctx.lang(), "commands.cancelled"));
       return;
     }
@@ -221,8 +336,46 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       }
     }
 
+    const lang = ctx.lang();
+    const state = ctx.session.state;
+
+    if (state === "uploading") {
+      const fileCount = ctx.session.uploadedFiles?.length ?? 0;
+      const msg = fileCount > 0
+        ? t(lang, "cancel.uploading", { count: fileCount })
+        : t(lang, "cancel.uploading_empty");
+      resetSession(ctx.session);
+      await ctx.reply(msg);
+      return;
+    }
+
+    if (state === "configuring") {
+      resetSession(ctx.session);
+      await ctx.reply(t(lang, "cancel.configuring"));
+      return;
+    }
+
+    if (state === "reviewing") {
+      const count = ctx.session.draftQuestions?.length ?? 0;
+      resetSession(ctx.session);
+      await ctx.reply(t(lang, "cancel.reviewing", { count }));
+      return;
+    }
+
+    if (state === "editing") {
+      resetSession(ctx.session);
+      await ctx.reply(t(lang, "cancel.editing"));
+      return;
+    }
+
     resetSession(ctx.session);
-    await ctx.reply(t(ctx.lang(), "commands.cancelled"));
+    await ctx.reply(t(lang, "commands.cancelled"));
+  });
+
+  bot.command("stop", async (ctx) => {
+    const chatType = ctx.chat?.type;
+    if (chatType !== "group" && chatType !== "supergroup") return;
+    await stopGroupQuiz(ctx);
   });
 
   bot.command("help", async (ctx) => {
@@ -230,6 +383,10 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   });
 
   bot.command("language", async (ctx) => {
+    if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
+      await ctx.reply(t(ctx.lang(), "cmd.private_only"));
+      return;
+    }
     const lang = ctx.lang();
     logger.info("Language command received", { event: "command.language", userId: ctx.from?.id });
     await ctx.reply(t(lang, "language.prompt"), { reply_markup: buildLanguageKeyboard(lang) });
@@ -240,7 +397,7 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.answerCallbackQuery();
 
     if (ctx.user) {
-      await userRepository.updateSettings(ctx.user._id, { language: newLang });
+      await userRepository.updateSettings(ctx.user._id, { language: newLang, languagePrompted: true });
       if (ctx.from) userCache.delete(ctx.from.id);
     }
 
@@ -251,6 +408,14 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.reply(t(newLang, confirmKey));
 
     logger.info("Language changed", { event: "command.language.changed", userId: ctx.from?.id, lang: newLang });
+
+    if (ctx.session.awaitingLangForWelcome) {
+      ctx.session.awaitingLangForWelcome = undefined;
+      const text = ctx.isNewUser
+        ? t(newLang, "start.welcome_new", { name: ctx.from?.first_name ?? "" })
+        : t(newLang, "start.welcome_returning");
+      await ctx.reply(text, { reply_markup: buildWelcomeKeyboard(newLang) });
+    }
   });
 
   bot.on("message:text", async (ctx, next) => {
@@ -282,6 +447,26 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.reply(t(ctx.lang(), "commands.joinCancelled"));
   });
 
+  bot.callbackQuery(NEWTEST_CONFIRM_CALLBACK, async (ctx) => {
+    const lang = ctx.lang();
+    if (ctx.session.state === "testing") {
+      if (ctx.session.sessionId) {
+        await testSessionRepository.abandon(ctx.session.sessionId);
+      }
+      await import("../middlewares/rateLimitMiddleware.js").then(({ releaseActiveTestSessionSlot }) =>
+        releaseActiveTestSessionSlot(ctx)
+      );
+    }
+    resetSession(ctx.session);
+    await ctx.answerCallbackQuery();
+    await enterUploadFlow(ctx);
+  });
+
+  bot.callbackQuery(NEWTEST_CANCEL_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery({ text: t(ctx.lang(), "newtest.cancelled"), show_alert: false });
+    await ctx.deleteMessage().catch(() => undefined);
+  });
+
   bot.command("leaderboard", async (ctx) => {
     const lang = ctx.lang();
     const raw = typeof ctx.match === "string" ? ctx.match.trim() : undefined;
@@ -305,6 +490,56 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     const { text } = await renderLeaderboard(String(test._id), ctx.user?._id ? String(ctx.user._id) : undefined, lang);
     await ctx.reply(text);
+  });
+
+  bot.command("stats", async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.reply(t(lang, "error.userLoad"));
+      return;
+    }
+    const [stats, testsCreated] = await Promise.all([
+      testSessionRepository.getUserStats(ctx.user._id),
+      testRepository.countByCreator(ctx.user._id)
+    ]);
+    await ctx.reply(buildStatsMessage(stats, testsCreated, lang));
+  });
+
+  // Welcome screen button callbacks
+  bot.callbackQuery(START_NEWTEST_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await enterUploadFlow(ctx);
+  });
+
+  bot.callbackQuery(START_JOIN_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
+    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+  });
+
+  bot.callbackQuery(START_LANGUAGE_CALLBACK, async (ctx) => {
+    const lang = ctx.lang();
+    await ctx.answerCallbackQuery();
+    await ctx.reply(t(lang, "language.prompt"), { reply_markup: buildLanguageKeyboard(lang) });
+  });
+
+  bot.callbackQuery(START_HELP_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await ctx.reply(t(ctx.lang(), "commands.help"));
+  });
+
+  bot.callbackQuery(START_STATS_CALLBACK, async (ctx) => {
+    const lang = ctx.lang();
+    await ctx.answerCallbackQuery();
+    if (!ctx.user) {
+      await ctx.reply(t(lang, "error.userLoad"));
+      return;
+    }
+    const [stats, testsCreated] = await Promise.all([
+      testSessionRepository.getUserStats(ctx.user._id),
+      testRepository.countByCreator(ctx.user._id)
+    ]);
+    await ctx.reply(buildStatsMessage(stats, testsCreated, lang));
   });
 
   registerMyTestsHandler(bot);

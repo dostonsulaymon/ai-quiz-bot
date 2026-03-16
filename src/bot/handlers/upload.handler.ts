@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import { getAIProvider } from "../../ai/ai.factory.js";
+import { generateWithFallback } from "../../ai/ai.factory.js";
 import { assertGenerationRateLimit } from "../middlewares/rateLimitMiddleware.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
@@ -7,15 +7,19 @@ import { logger } from "../../shared/logger.js";
 import { ValidationError } from "../../shared/errors/ValidationError.js";
 import { DEFAULT_QUESTION_TYPES, type GenerateQuestionsInput, type QuestionType } from "../../shared/types/index.js";
 import { resetSession, type BotContext, type UploadedFile } from "../types.js";
+import { transitionTo } from "../state-machine.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import { TestRepository } from "../../db/repositories/test.repository.js";
 import { enterTestFlow } from "./test.handler.js";
 import { enterReviewFlow } from "./review.handler.js";
+import { storeUploadData, getUploadData, deleteAllUploadData } from "../utils/upload-storage.js";
 
 const testRepository = new TestRepository();
 
 const DONE_ADDING_IMAGES_CALLBACK = "upload:images:done";
 const RETRY_GENERATION_CALLBACK = "upload:generation:retry";
+const TITLE_SKIP_CALLBACK = "upload:title:skip";
+const TEXT_START_CALLBACK = "upload:text:start";
 const QUESTION_COUNT_CALLBACK_PREFIX = "upload:count:";
 const QUESTION_TYPES_CALLBACK_PREFIX = "upload:types:";
 const QUESTION_TYPES_CONFIRM_CALLBACK = "upload:types:confirm";
@@ -156,25 +160,27 @@ const validateFileSize = (fileSize: number | undefined, lang: Language): void =>
   }
 };
 
+type ResolvedFile = UploadedFile & { base64: string };
+
 const buildGenerateInput = (
-  uploadedFiles: UploadedFile[],
+  filesWithData: ResolvedFile[],
   questionCount: number,
   questionTypes: QuestionType[]
 ): GenerateQuestionsInput => {
-  const firstFile = uploadedFiles[0];
+  const firstFile = filesWithData[0];
   if (!firstFile) {
     throw new ValidationError("No uploaded files are available for generation", "UPLOAD_MISSING");
   }
 
   if (firstFile.type === "pdf") {
-    return { content: { type: "pdf", base64: firstFile.base64 ?? "" }, questionCount, questionTypes };
+    return { content: { type: "pdf", base64: firstFile.base64 }, questionCount, questionTypes };
   }
 
   return {
     content: {
       type: "images",
-      images: uploadedFiles.map((file) => ({
-        base64: file.base64 ?? "",
+      images: filesWithData.map((file) => ({
+        base64: file.base64,
         mimeType: file.mimeType ?? "image/jpeg"
       }))
     },
@@ -183,37 +189,16 @@ const buildGenerateInput = (
   };
 };
 
+const buildUploadPromptKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "upload.text.btn"), TEXT_START_CALLBACK);
+
 /** Enter the upload flow: reset session, set state, send prompt. */
 export const enterUploadFlow = async (ctx: BotContext): Promise<void> => {
   resetSession(ctx.session);
-  ctx.session.state = "uploading";
+  transitionTo(ctx.session, "uploading", "enterUploadFlow");
   ctx.session.uploadStep = "waiting_file";
   logger.info("Upload flow entered", { event: "upload.flow.enter", userId: ctx.from?.id });
-  await ctx.reply(t(ctx.lang(), "upload.prompt"));
-};
-
-/** Handle one update while in the uploading/configuring states. */
-export const uploadRouter = async (ctx: BotContext): Promise<void> => {
-  const step = ctx.session.uploadStep ?? "waiting_file";
-
-  if (step === "waiting_file") {
-    await handleWaitingFile(ctx);
-    return;
-  }
-
-  if (step === "waiting_count") {
-    await handleWaitingCount(ctx);
-    return;
-  }
-
-  if (step === "waiting_count_custom") {
-    await handleWaitingCountCustom(ctx);
-    return;
-  }
-
-  if (step === "waiting_types") {
-    await handleWaitingTypes(ctx);
-  }
+  await ctx.reply(t(ctx.lang(), "upload.prompt"), { reply_markup: buildUploadPromptKeyboard(ctx.lang()) });
 };
 
 // ---------------------------------------------------------------------------
@@ -221,10 +206,26 @@ export const uploadRouter = async (ctx: BotContext): Promise<void> => {
 // ---------------------------------------------------------------------------
 
 const handleWaitingFile = async (ctx: BotContext): Promise<void> => {
+  // Handle "Type/Paste Text" button click.
+  if (ctx.callbackQuery?.data === TEXT_START_CALLBACK) {
+    await ctx.answerCallbackQuery();
+    ctx.session.uploadStep = "waiting_text";
+    ctx.session.uploadSourceType = "text";
+    const lang = ctx.lang();
+    await ctx.reply(t(lang, "upload.text.prompt"), {
+      reply_markup: new InlineKeyboard().text(t(lang, "btn.cancel"), "upload:text:cancel")
+    });
+    return;
+  }
+
   const isDocument = Boolean(ctx.msg?.document);
   const isPhoto = Boolean(ctx.msg?.photo?.length);
 
   if (!isDocument && !isPhoto) {
+    if (ctx.callbackQuery) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
     await ctx.reply(t(ctx.lang(), "upload.invalidFile"));
     return;
   }
@@ -250,6 +251,49 @@ const handleWaitingFile = async (ctx: BotContext): Promise<void> => {
   await handleFirstImage(ctx);
 };
 
+// ---------------------------------------------------------------------------
+// Step: waiting_text
+// ---------------------------------------------------------------------------
+
+const TEXT_MIN_LENGTH = 100;
+const TEXT_MAX_LENGTH = 10_000;
+
+const handleWaitingText = async (ctx: BotContext): Promise<void> => {
+  const lang = ctx.lang();
+
+  // Cancel button
+  if (ctx.callbackQuery?.data === "upload:text:cancel") {
+    await ctx.answerCallbackQuery();
+    resetSession(ctx.session);
+    await ctx.reply(t(lang, "upload.prompt"), { reply_markup: buildUploadPromptKeyboard(lang) });
+    transitionTo(ctx.session, "uploading", "handleWaitingText.cancel");
+    ctx.session.uploadStep = "waiting_file";
+    return;
+  }
+
+  const text = ctx.message?.text;
+  if (!text || ctx.message?.text?.startsWith("/")) {
+    if (ctx.callbackQuery) { await ctx.answerCallbackQuery(); return; }
+    return;
+  }
+
+  if (text.length < TEXT_MIN_LENGTH) {
+    await ctx.reply(t(lang, "upload.text.too_short"));
+    return;
+  }
+
+  if (text.length > TEXT_MAX_LENGTH) {
+    await ctx.reply(t(lang, "upload.text.too_long"));
+    return;
+  }
+
+  ctx.session.uploadedText = text;
+  ctx.session.uploadSourceType = "text";
+  logger.info("Text input received", { event: "upload.text.received", userId: ctx.from?.id, chars: text.length });
+  await ctx.reply(t(lang, "upload.text.received", { chars: text.length }));
+  await transitionToWaitingCount(ctx);
+};
+
 const handlePdfUpload = async (ctx: BotContext): Promise<void> => {
   const document = ctx.msg?.document;
   if (!document) return;
@@ -268,7 +312,8 @@ const handlePdfUpload = async (ctx: BotContext): Promise<void> => {
   try {
     const buffer = await getTelegramFileBuffer(ctx, document.file_id);
     const base64 = buffer.toString("base64");
-    ctx.session.uploadedFiles = [{ type: "pdf", fileId: document.file_id, base64 }];
+    const storageKey = await storeUploadData(ctx.redis, ctx.from!.id, document.file_id, base64);
+    ctx.session.uploadedFiles = [{ type: "pdf", fileId: document.file_id, storageKey }];
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
       await ctx.reply(t(lang, "error.file_download_timeout"));
@@ -306,7 +351,8 @@ const handleFirstImage = async (ctx: BotContext): Promise<void> => {
   try {
     const buffer = await getTelegramFileBuffer(ctx, imageInfo.fileId);
     const base64 = buffer.toString("base64");
-    ctx.session.uploadedFiles = [{ type: "image", fileId: imageInfo.fileId, base64, mimeType: imageInfo.mimeType }];
+    const storageKey = await storeUploadData(ctx.redis, ctx.from!.id, imageInfo.fileId, base64);
+    ctx.session.uploadedFiles = [{ type: "image", fileId: imageInfo.fileId, storageKey, mimeType: imageInfo.mimeType }];
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
       await ctx.reply(t(lang, "error.file_download_timeout"));
@@ -377,7 +423,8 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
   try {
     const buffer = await getTelegramFileBuffer(ctx, imageInfo.fileId);
     const base64 = buffer.toString("base64");
-    files.push({ type: "image", fileId: imageInfo.fileId, base64, mimeType: imageInfo.mimeType });
+    const storageKey = await storeUploadData(ctx.redis, ctx.from!.id, imageInfo.fileId, base64);
+    files.push({ type: "image", fileId: imageInfo.fileId, storageKey, mimeType: imageInfo.mimeType });
     ctx.session.uploadedFiles = files;
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
@@ -411,7 +458,7 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
 // ---------------------------------------------------------------------------
 
 const transitionToWaitingCount = async (ctx: BotContext): Promise<void> => {
-  ctx.session.state = "configuring";
+  transitionTo(ctx.session, "configuring", "transitionToWaitingCount");
   ctx.session.uploadStep = "waiting_count";
   await ctx.reply(t(ctx.lang(), "upload.howManyQuestions"), { reply_markup: buildQuestionCountKeyboard(ctx.lang()) });
 };
@@ -529,6 +576,43 @@ const handleWaitingTimer = async (ctx: BotContext): Promise<void> => {
   ctx.session.timeLimitSeconds = seconds;
 
   logger.info("Timer preference selected", { event: "upload.config.timer", userId: ctx.from?.id, timeLimitSeconds: seconds });
+  await transitionToWaitingTitle(ctx);
+};
+
+// ---------------------------------------------------------------------------
+// Step: waiting_title
+// ---------------------------------------------------------------------------
+
+const buildTitleSkipKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "upload.title.skip"), TITLE_SKIP_CALLBACK);
+
+const transitionToWaitingTitle = async (ctx: BotContext): Promise<void> => {
+  ctx.session.uploadStep = "waiting_title";
+  await ctx.reply(t(ctx.lang(), "upload.title.prompt"), { reply_markup: buildTitleSkipKeyboard(ctx.lang()) });
+};
+
+const handleWaitingTitle = async (ctx: BotContext): Promise<void> => {
+  if (ctx.callbackQuery?.data === TITLE_SKIP_CALLBACK) {
+    await ctx.answerCallbackQuery();
+    ctx.session.editingTitle = undefined;
+    logger.info("Title skipped", { event: "upload.config.title_skipped", userId: ctx.from?.id });
+    await runGeneration(ctx);
+    return;
+  }
+
+  const text = ctx.msg?.text?.trim();
+  if (!text) {
+    if (ctx.callbackQuery) await ctx.answerCallbackQuery();
+    return;
+  }
+
+  if (text.length > 100) {
+    await ctx.reply(t(ctx.lang(), "upload.title.too_long"));
+    return;
+  }
+
+  ctx.session.editingTitle = text;
+  logger.info("Title set", { event: "upload.config.title_set", userId: ctx.from?.id, titleLength: text.length });
   await runGeneration(ctx);
 };
 
@@ -581,14 +665,34 @@ const handleWaitingTypes = async (ctx: BotContext): Promise<void> => {
 // ---------------------------------------------------------------------------
 
 const runGeneration = async (ctx: BotContext): Promise<void> => {
-  const { uploadedFiles, questionCount, questionTypes } = ctx.session;
+  const { uploadedFiles, uploadedText, uploadSourceType, questionCount, questionTypes } = ctx.session;
   const lang = ctx.lang();
 
-  if (!questionCount || !questionTypes?.length || !uploadedFiles?.length) {
+  if (!questionCount || !questionTypes?.length) {
     throw new ValidationError("Upload session is missing data required for generation", "UPLOAD_SESSION_INCOMPLETE");
   }
 
-  const input = buildGenerateInput(uploadedFiles, questionCount, questionTypes);
+  let input: GenerateQuestionsInput;
+
+  if (uploadSourceType === "text") {
+    if (!uploadedText) {
+      throw new ValidationError("Upload session is missing text data for generation", "UPLOAD_SESSION_INCOMPLETE");
+    }
+    input = { content: { type: "text", text: uploadedText }, questionCount, questionTypes };
+  } else {
+    if (!uploadedFiles?.length) {
+      throw new ValidationError("Upload session is missing file data for generation", "UPLOAD_SESSION_INCOMPLETE");
+    }
+    // Resolve base64 data from Redis for all uploaded files
+    const base64Entries = await Promise.all(uploadedFiles.map((f) => getUploadData(ctx.redis, f.storageKey)));
+    if (base64Entries.some((b) => b === null)) {
+      await ctx.reply(t(lang, "upload.expired"));
+      resetSession(ctx.session);
+      return;
+    }
+    const filesWithData: ResolvedFile[] = uploadedFiles.map((file, i) => ({ ...file, base64: base64Entries[i]! }));
+    input = buildGenerateInput(filesWithData, questionCount, questionTypes);
+  }
 
   await ctx.replyWithChatAction("typing");
   const thinkingMsg = await ctx.reply(t(lang, "upload.generating"));
@@ -604,7 +708,9 @@ const runGeneration = async (ctx: BotContext): Promise<void> => {
 
   try {
     await assertGenerationRateLimit(ctx);
-    const questions = await getAIProvider().generateQuestions(input);
+    const questions = await generateWithFallback(input, async () => {
+      await ctx.reply(t(lang, "upload.ai_fallback"));
+    });
 
     logger.info("AI generation succeeded", {
       event: "ai.generation.success",
@@ -617,9 +723,10 @@ const runGeneration = async (ctx: BotContext): Promise<void> => {
     ctx.session.reviewIndex = 0;
     ctx.session.uploadStep = "waiting_action";
     ctx.session.uploadTypesMessageId = undefined;
-    ctx.session.uploadSourceType = uploadedFiles[0]?.type === "pdf" ? "pdf" : "images";
-    // Clear base64 content — only needed for the AI call (P5).
-    ctx.session.uploadedFiles = [];
+    if (uploadSourceType !== "text") {
+      ctx.session.uploadSourceType = uploadedFiles![0]?.type === "pdf" ? "pdf" : "images";
+    }
+    // Keep uploadedFiles/uploadedText in session — review flow may need them for regeneration.
   } catch (error) {
     logger.error("AI generation failed", {
       event: "ai.generation.failed",
@@ -635,8 +742,38 @@ const runGeneration = async (ctx: BotContext): Promise<void> => {
   }
 
   if (ctx.session.uploadStep === "waiting_action") {
-    const n = ctx.session.draftQuestions?.length ?? 0;
-    await ctx.reply(t(lang, "upload.action.prompt", { n }), { reply_markup: buildActionKeyboard(lang) });
+    const questions = ctx.session.draftQuestions ?? [];
+    const total = questions.length;
+
+    // Build type-count map
+    const typeCounts = new Map<string, number>();
+    for (const q of questions) {
+      typeCounts.set(q.type, (typeCounts.get(q.type) ?? 0) + 1);
+    }
+
+    let readyLine: string;
+    if (typeCounts.size === 1) {
+      const [[type]] = [...typeCounts.entries()];
+      const typeLabel = t(lang, `upload.type.${type}` as Parameters<typeof t>[1]);
+      readyLine = t(lang, "upload.action.ready_single", { count: total, type: typeLabel });
+    } else {
+      const breakdown = [...typeCounts.entries()]
+        .map(([type, count]) => `${count} ${t(lang, `upload.type.${type}` as Parameters<typeof t>[1])}`)
+        .join(", ");
+      readyLine = t(lang, "upload.action.ready_mixed", { count: total, breakdown });
+    }
+
+    const text = [
+      readyLine,
+      "━━━━━━━━━━━━━━━━",
+      t(lang, "upload.action.prompt"),
+      "",
+      t(lang, "upload.action.start_desc"),
+      t(lang, "upload.action.review_desc"),
+      t(lang, "upload.action.save_desc")
+    ].join("\n");
+
+    await ctx.reply(text, { reply_markup: buildActionKeyboard(lang) });
   }
 };
 
@@ -657,9 +794,8 @@ const handleWaitingAction = async (ctx: BotContext): Promise<void> => {
   const lang = ctx.lang();
 
   if (action === "review") {
-    ctx.session.state = "reviewing";
     ctx.session.uploadStep = undefined;
-    // Router's post-check will call enterReviewFlow automatically.
+    // enterReviewFlow handles the state transition to "reviewing".
     await enterReviewFlow(ctx);
     return;
   }
@@ -676,8 +812,13 @@ const handleWaitingAction = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
+  // Delete upload data from Redis — no longer needed after confirming action.
+  const uploadStorageKeys = (ctx.session.uploadedFiles ?? []).map((f) => f.storageKey);
+  await deleteAllUploadData(ctx.redis, uploadStorageKeys);
+
   const savedTest = await testRepository.create({
     creatorId: ctx.user._id,
+    title: ctx.session.editingTitle ?? t(lang, "test.default_title"),
     questions: draftQuestions,
     sourceType: ctx.session.uploadSourceType ?? "images",
     questionCount: draftQuestions.length,
@@ -692,9 +833,7 @@ const handleWaitingAction = async (ctx: BotContext): Promise<void> => {
     ctx.session.activeTestId = testId;
     ctx.session.uploadStep = undefined;
     ctx.session.draftQuestions = [];
-    ctx.session.state = "testing";
-    ctx.session.testSubState = "answering";
-    ctx.session.testCorrectCount = 0;
+    // enterTestFlow handles the state transition to "testing".
     logger.info("Test started from action menu", { event: "upload.action.start", userId: ctx.from?.id, testId });
     await enterTestFlow(ctx, testId);
     return;
@@ -705,9 +844,10 @@ const handleWaitingAction = async (ctx: BotContext): Promise<void> => {
     const code = `TEST-${testWithCode.shareCode}`;
     const username = ctx.me.username ?? "your_bot";
     const link = `https://t.me/${username}?start=${code}`;
+    const instructions = t(lang, "share.instructions", { code, link });
     logger.info("Test saved and shared from action menu", { event: "upload.action.save", userId: ctx.from?.id, testId });
     resetSession(ctx.session);
-    await ctx.reply(t(lang, "upload.action.saveShareCard", { code, link }));
+    await ctx.reply(t(lang, "upload.action.saveShareCard", { instructions }));
   }
 };
 
@@ -737,6 +877,11 @@ export const uploadRouterFull = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
+  if (step === "waiting_text") {
+    await handleWaitingText(ctx);
+    return;
+  }
+
   if (step === "waiting_count") {
     await handleWaitingCount(ctx);
     return;
@@ -754,6 +899,11 @@ export const uploadRouterFull = async (ctx: BotContext): Promise<void> => {
 
   if (step === "waiting_timer") {
     await handleWaitingTimer(ctx);
+    return;
+  }
+
+  if (step === "waiting_title") {
+    await handleWaitingTitle(ctx);
     return;
   }
 
