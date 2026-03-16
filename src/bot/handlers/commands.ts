@@ -5,6 +5,7 @@ import { UserRepository } from "../../db/repositories/user.repository.js";
 import { logger } from "../../shared/logger.js";
 import { registerHistoryHandler } from "./history.handler.js";
 import { registerMyTestsHandler } from "./mytests.handler.js";
+import { registerClassesHandler, showClassPreviewFromShareCode, showMyClassesPage } from "./classes.handler.js";
 import { registerLeaderboardHandler, renderLeaderboard } from "./leaderboard.handler.js";
 import { registerSettingsHandler, buildSettingsPage } from "./settings.handler.js";
 import { registerGroupHandlers, startGroupQuiz, cancelGroupQuiz, stopGroupQuiz } from "./group.handler.js";
@@ -24,6 +25,7 @@ const commands: BotCommand[] = [
   { command: "newtest", description: "Create a new test from text, PDF, or images" },
   { command: "join", description: "Join a shared test using a share code" },
   { command: "mytests", description: "List tests you created" },
+  { command: "myclasses", description: "Manage your classes of tests" },
   { command: "history", description: "View your past test sessions" },
   { command: "stats", description: "View your overall performance statistics" },
   { command: "settings", description: "Configure your default test preferences" },
@@ -46,6 +48,7 @@ const START_LANGUAGE_CALLBACK = "start:language";
 const START_HELP_CALLBACK = "start:help";
 const START_STATS_CALLBACK = "start:stats";
 const START_SETTINGS_CALLBACK = "start:settings";
+const START_CLASSES_CALLBACK = "start:classes";
 const testRepository = new TestRepository();
 const userRepository = new UserRepository();
 const testSessionRepository = new TestSessionRepository();
@@ -109,7 +112,9 @@ const buildWelcomeKeyboard = (lang: Language): InlineKeyboard =>
     .text(t(lang, "start.btn.stats"), START_STATS_CALLBACK)
     .text(t(lang, "start.btn.settings"), START_SETTINGS_CALLBACK)
     .row()
+    .text(t(lang, "start.btn.classes"), START_CLASSES_CALLBACK)
     .text(t(lang, "start.btn.language"), START_LANGUAGE_CALLBACK)
+    .row()
     .text(t(lang, "start.btn.help"), START_HELP_CALLBACK);
 
 const buildStatsMessage = (stats: UserStats, testsCreated: number, lang: Language): string => {
@@ -174,6 +179,10 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     if (payload?.startsWith("TEST-")) {
       return handleJoinByCode(ctx, payload);
+    }
+
+    if (payload?.startsWith("CLASS-")) {
+      return showClassPreviewFromShareCode(ctx, payload);
     }
 
     const lang = ctx.lang();
@@ -574,7 +583,13 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.reply(text, { reply_markup: keyboard });
   });
 
+  bot.callbackQuery(START_CLASSES_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await showMyClassesPage(ctx, 1);
+  });
+
   registerMyTestsHandler(bot);
+  registerClassesHandler(bot);
   registerHistoryHandler(bot);
   registerLeaderboardHandler(bot);
   registerGroupHandlers(bot);

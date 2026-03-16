@@ -170,4 +170,13 @@ export class TestSessionRepository {
     }
     return map;
   }
+
+  async abandonStaleSessions(olderThanMs: number): Promise<number> {
+    const cutoff = new Date(Date.now() - olderThanMs);
+    const result = await TestSessionModel.updateMany(
+      { status: "in_progress", startedAt: { $lt: cutoff } },
+      { $set: { status: "abandoned", completedAt: new Date() } }
+    ).exec();
+    return result.modifiedCount;
+  }
 }

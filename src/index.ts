@@ -4,6 +4,7 @@ import { config } from "./config/index.js";
 import { connectToDatabase } from "./db/connection.js";
 import { createRedisClient } from "./redis/index.js";
 import { GroupSessionRepository } from "./db/repositories/group-session.repository.js";
+import { TestSessionRepository } from "./db/repositories/test-session.repository.js";
 import { TestRepository } from "./db/repositories/test.repository.js";
 import { runGroupAutoAdvance } from "./bot/handlers/group.handler.js";
 import { logger } from "./shared/logger.js";
@@ -11,6 +12,18 @@ import type { BotSession } from "./bot/types.js";
 import type { Language } from "./shared/i18n/index.js";
 
 const SESSION_KEY_PREFIX = "quiz-bot:session:";
+
+const runSessionCleanup = async (
+  groupSessionRepo: GroupSessionRepository,
+  testSessionRepo: TestSessionRepository
+): Promise<{ abandonedGroups: number; abandonedTests: number }> => {
+  const [abandonedGroups, abandonedTests] = await Promise.all([
+    groupSessionRepo.abandonStaleSessions(config.STALE_GROUP_SESSION_TTL_MS),
+    testSessionRepo.abandonStaleSessions(config.ABANDONED_SESSION_TTL_MS)
+  ]);
+
+  return { abandonedGroups, abandonedTests };
+};
 
 /** Mark expired private-test timers in Redis so the next user interaction auto-advances. */
 const recoverExpiredPrivateTimers = async (redis: Awaited<ReturnType<typeof createRedisClient>>): Promise<void> => {
@@ -85,11 +98,21 @@ const bootstrap = async (): Promise<void> => {
   await connectToDatabase();
 
   const groupSessionRepo = new GroupSessionRepository();
+  const testSessionRepo = new TestSessionRepository();
   const testRepo = new TestRepository();
 
-  const abandoned = await groupSessionRepo.abandonStaleSessions(config.STALE_GROUP_SESSION_TTL_MS);
-  if (abandoned > 0) {
-    logger.info("Cleaned up orphaned group sessions on startup", { event: "startup.group_sessions.cleanup", abandoned });
+  const { abandonedGroups, abandonedTests } = await runSessionCleanup(groupSessionRepo, testSessionRepo);
+  if (abandonedGroups > 0) {
+    logger.info("Cleaned up orphaned group sessions on startup", {
+      event: "startup.group_sessions.cleanup",
+      abandonedGroups
+    });
+  }
+  if (abandonedTests > 0) {
+    logger.info("Cleaned up abandoned test sessions on startup", {
+      event: "startup.test_sessions.cleanup",
+      abandonedTests
+    });
   }
 
   await recoverExpiredPrivateTimers(redis);
@@ -104,6 +127,27 @@ const bootstrap = async (): Promise<void> => {
       console.info(`[bot] Quiz Bot started in ${config.NODE_ENV} mode`);
     }
   });
+
+  const cleanupInterval = setInterval(() => {
+    void (async () => {
+      try {
+        const { abandonedGroups: groups, abandonedTests: tests } = await runSessionCleanup(groupSessionRepo, testSessionRepo);
+        if (groups > 0 || tests > 0) {
+          logger.info("Hourly session cleanup completed", {
+            event: "startup.session_cleanup.hourly",
+            groups,
+            tests
+          });
+        }
+      } catch (error) {
+        logger.error("Hourly session cleanup failed", {
+          event: "startup.session_cleanup.hourly_failed",
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    })();
+  }, 60 * 60 * 1000);
+  cleanupInterval.unref();
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     console.info(`[app] Received ${signal}, shutting down gracefully`);

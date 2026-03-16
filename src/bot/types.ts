@@ -48,6 +48,9 @@ export type BotSession = {
   sessionRecovered?: boolean;
   settingsAwaitingCustomCount?: boolean;
   settingsReturnToMenu?: boolean;
+  classEditorMode?: "create" | "edit";
+  classEditingId?: string;
+  activeClassId?: string;
   uploadedFiles?: UploadedFile[];
   uploadSourceType?: "pdf" | "images" | "text";
   shuffleQuestions?: boolean;
@@ -112,6 +115,9 @@ export const createInitialSession = (): BotSession => ({
   sessionRecovered: undefined,
   settingsAwaitingCustomCount: undefined,
   settingsReturnToMenu: undefined,
+  classEditorMode: undefined,
+  classEditingId: undefined,
+  activeClassId: undefined,
   uploadedFiles: undefined,
   uploadedText: undefined,
   settingsDraftTypes: undefined,

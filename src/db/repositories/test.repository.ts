@@ -38,6 +38,12 @@ export class TestRepository {
     return TestModel.findById(id).exec();
   }
 
+  async findByIdsOrdered(ids: Types.ObjectId[]): Promise<TestDocument[]> {
+    const tests = await TestModel.find({ _id: { $in: ids }, isActive: true }).exec();
+    const map = new Map(tests.map((test) => [String(test._id), test]));
+    return ids.map((id) => map.get(String(id))).filter((test): test is TestDocument => Boolean(test));
+  }
+
   async ensureShareCode(id: string | Types.ObjectId): Promise<TestDocument> {
     const existingTest = await TestModel.findById(id).exec();
     if (!existingTest) {
