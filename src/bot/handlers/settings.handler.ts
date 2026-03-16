@@ -14,6 +14,7 @@ import type { UserDocument } from "../../db/models/user.model.js";
 export const SETTINGS_MENU_CB = "settings:menu";
 const SETTINGS_COUNT_CB = "settings:count";
 const SETTINGS_COUNT_PREFIX = "settings:count:";
+const SETTINGS_COUNT_CUSTOM_CB = "settings:count:custom";
 const SETTINGS_TYPES_CB = "settings:types";
 const SETTINGS_TYPES_TOGGLE_PREFIX = "settings:types:toggle:";
 const SETTINGS_TYPES_CONFIRM_CB = "settings:types:confirm";
@@ -22,10 +23,10 @@ const SETTINGS_TIMER_PREFIX = "settings:timer:";
 const SETTINGS_SHUFFLE_CB = "settings:shuffle";
 const SETTINGS_SHUFFLE_PREFIX = "settings:shuffle:";
 const SETTINGS_LANGUAGE_CB = "settings:language";
-const SETTINGS_LANG_PREFIX = "settings:lang:";
 const SETTINGS_DONE_CB = "settings:done";
 
 const userRepository = new UserRepository();
+const CUSTOM_COUNT_MAX = 50;
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -33,7 +34,7 @@ const userRepository = new UserRepository();
 
 const formatTimerLabel = (seconds: number, lang: Language): string => {
   switch (seconds) {
-    case 0: return t(lang, "upload.timer.btn.none");
+    case 0: return t(lang, "settings.timer_none");
     case 15: return t(lang, "upload.timer.btn.15");
     case 30: return t(lang, "upload.timer.btn.30");
     case 60: return t(lang, "upload.timer.btn.60");
@@ -43,13 +44,12 @@ const formatTimerLabel = (seconds: number, lang: Language): string => {
 };
 
 const formatShuffleLabel = (shuffleQ: boolean, shuffleO: boolean, lang: Language): string => {
-  if (shuffleQ && shuffleO) return t(lang, "upload.shuffle.both");
-  if (shuffleQ) return t(lang, "upload.shuffle.questions");
-  return t(lang, "upload.shuffle.none");
+  if (shuffleQ && shuffleO) return t(lang, "settings.shuffle_both");
+  if (shuffleQ) return t(lang, "settings.shuffle_questions");
+  return t(lang, "settings.shuffle_none");
 };
 
 const buildSettingsText = (user: UserDocument, lang: Language): string => {
-  const SEP = "━━━━━━━━━━━━━━━━";
   const count = user.defaultQuestionCount ?? 10;
   const types = (user.defaultQuestionTypes ?? []) as QuestionType[];
   const timer = user.defaultTimeLimitSeconds ?? 0;
@@ -58,15 +58,12 @@ const buildSettingsText = (user: UserDocument, lang: Language): string => {
 
   const typesLabel = types.length > 0 ? formatQuestionTypes(types, lang) : "—";
 
-  return [
-    t(lang, "settings.title"),
-    SEP,
-    t(lang, "settings.default_count", { count }),
-    t(lang, "settings.default_types", { types: typesLabel }),
-    t(lang, "settings.default_timer", { timer: formatTimerLabel(timer, lang) }),
-    t(lang, "settings.default_shuffle", { shuffle: formatShuffleLabel(shuffleQ, shuffleO, lang) }),
-    SEP
-  ].join("\n");
+  return t(lang, "settings.title", {
+    count,
+    types: typesLabel,
+    timer: formatTimerLabel(timer, lang),
+    shuffle: formatShuffleLabel(shuffleQ, shuffleO, lang)
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -82,7 +79,6 @@ const buildSettingsKeyboard = (lang: Language): InlineKeyboard =>
     .text(t(lang, "settings.btn.shuffle"), SETTINGS_SHUFFLE_CB)
     .row()
     .text(t(lang, "settings.btn.language"), SETTINGS_LANGUAGE_CB)
-    .row()
     .text(t(lang, "settings.btn.done"), SETTINGS_DONE_CB);
 
 const buildCountKeyboard = (lang: Language): InlineKeyboard =>
@@ -92,6 +88,7 @@ const buildCountKeyboard = (lang: Language): InlineKeyboard =>
     .text("15", `${SETTINGS_COUNT_PREFIX}15`)
     .text("20", `${SETTINGS_COUNT_PREFIX}20`)
     .row()
+    .text(t(lang, "upload.btn.custom"), SETTINGS_COUNT_CUSTOM_CB)
     .text(t(lang, "btn.back"), SETTINGS_MENU_CB);
 
 const buildTypesKeyboard = (selectedTypes: QuestionType[], lang: Language): InlineKeyboard => {
@@ -134,8 +131,8 @@ const buildShuffleKeyboard = (lang: Language): InlineKeyboard =>
 
 const buildLanguageKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard()
-    .text(t(lang, "language.btn.en"), `${SETTINGS_LANG_PREFIX}en`)
-    .text(t(lang, "language.btn.uz"), `${SETTINGS_LANG_PREFIX}uz`)
+    .text(t(lang, "language.btn.en"), "lang:en")
+    .text(t(lang, "language.btn.uz"), "lang:uz")
     .row()
     .text(t(lang, "btn.back"), SETTINGS_MENU_CB);
 
@@ -181,10 +178,18 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     const lang = ctx.lang();
     const count = parseInt(ctx.callbackQuery.data.slice(SETTINGS_COUNT_PREFIX.length), 10);
     await userRepository.updatePreferences(ctx.user._id, { defaultQuestionCount: count });
+    ctx.user.defaultQuestionCount = count;
     if (ctx.from) userCache.delete(ctx.from.id);
     await ctx.answerCallbackQuery();
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
+  });
+
+  bot.callbackQuery(SETTINGS_COUNT_CUSTOM_CB, async (ctx) => {
+    if (!ctx.user) { await ctx.answerCallbackQuery(); return; }
+    ctx.session.settingsAwaitingCustomCount = true;
+    await ctx.answerCallbackQuery();
+    await ctx.reply(t(ctx.lang(), "upload.customCountPrompt"));
   });
 
   // ── Types ────────────────────────────────────────────────────────────────
@@ -221,6 +226,7 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
       return;
     }
     await userRepository.updatePreferences(ctx.user._id, { defaultQuestionTypes: types });
+    ctx.user.defaultQuestionTypes = types;
     if (ctx.from) userCache.delete(ctx.from.id);
     ctx.session.settingsDraftTypes = undefined;
     await ctx.answerCallbackQuery();
@@ -243,6 +249,7 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     const lang = ctx.lang();
     const seconds = parseInt(ctx.callbackQuery.data.slice(SETTINGS_TIMER_PREFIX.length), 10);
     await userRepository.updatePreferences(ctx.user._id, { defaultTimeLimitSeconds: seconds });
+    ctx.user.defaultTimeLimitSeconds = seconds;
     if (ctx.from) userCache.delete(ctx.from.id);
     await ctx.answerCallbackQuery();
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
@@ -269,6 +276,8 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
       defaultShuffleQuestions: shuffleQ,
       defaultShuffleOptions: shuffleO
     });
+    ctx.user.defaultShuffleQuestions = shuffleQ;
+    ctx.user.defaultShuffleOptions = shuffleO;
     if (ctx.from) userCache.delete(ctx.from.id);
     await ctx.answerCallbackQuery();
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
@@ -279,22 +288,11 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
 
   bot.callbackQuery(SETTINGS_LANGUAGE_CB, async (ctx) => {
     if (!ctx.user) { await ctx.answerCallbackQuery(); return; }
+    ctx.session.settingsReturnToMenu = true;
     await ctx.answerCallbackQuery();
     await safeEditMessage(ctx, t(ctx.lang(), "language.prompt"), {
       reply_markup: buildLanguageKeyboard(ctx.lang())
     });
-  });
-
-  bot.callbackQuery(new RegExp(`^${SETTINGS_LANG_PREFIX}(en|uz)$`), async (ctx) => {
-    if (!ctx.user) { await ctx.answerCallbackQuery(); return; }
-    const newLang = ctx.callbackQuery.data.slice(SETTINGS_LANG_PREFIX.length) as Language;
-    await userRepository.updateSettings(ctx.user._id, { language: newLang, languagePrompted: true });
-    if (ctx.from) userCache.delete(ctx.from.id);
-    ctx.session.language = newLang;
-    ctx.lang = () => newLang;
-    await ctx.answerCallbackQuery();
-    const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), newLang);
-    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   // ── Done ─────────────────────────────────────────────────────────────────
@@ -305,5 +303,38 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     await ctx.answerCallbackQuery({ text: t(lang, "settings.saved"), show_alert: false });
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
+  });
+
+  bot.on("message:text", async (ctx, next) => {
+    if (!ctx.session.settingsAwaitingCustomCount) {
+      await next();
+      return;
+    }
+
+    if (!ctx.user) {
+      ctx.session.settingsAwaitingCustomCount = undefined;
+      await next();
+      return;
+    }
+
+    const raw = ctx.message.text.trim();
+    if (raw.startsWith("/")) {
+      await next();
+      return;
+    }
+
+    const count = Number(raw);
+    if (!Number.isInteger(count) || count < 1 || count > CUSTOM_COUNT_MAX) {
+      await ctx.reply(t(ctx.lang(), "upload.invalidCount"));
+      return;
+    }
+
+    ctx.session.settingsAwaitingCustomCount = undefined;
+    await userRepository.updatePreferences(ctx.user._id, { defaultQuestionCount: count });
+    ctx.user.defaultQuestionCount = count;
+    if (ctx.from) userCache.delete(ctx.from.id);
+
+    const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), ctx.lang());
+    await ctx.reply(text, { reply_markup: keyboard });
   });
 };

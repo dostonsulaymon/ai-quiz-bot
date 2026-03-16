@@ -1,4 +1,4 @@
-import { InlineKeyboard, type Bot } from "grammy";
+import { InlineKeyboard, InputFile, type Bot } from "grammy";
 import { TestRepository } from "../../db/repositories/test.repository.js";
 import { TestSessionRepository } from "../../db/repositories/test-session.repository.js";
 import { LeaderboardRepository } from "../../db/repositories/leaderboard.repository.js";
@@ -9,6 +9,7 @@ import { enterEditFlow } from "./edit.handler.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import { formatDate } from "../utils/format.js";
 import { safeEditMessage } from "../utils/telegram.js";
+import { generateTestPDF } from "../utils/pdf-export.js";
 
 const MYTESTS_PAGE_SIZE = 5;
 const MYTESTS_PAGE_CALLBACK_PREFIX = "mytests:page:";
@@ -21,6 +22,7 @@ const MYTESTS_PREVIEW_CALLBACK_PREFIX = "mytests:preview:";
 const MYTESTS_BACK_CALLBACK_PREFIX = "mytests:back:";
 const MYTESTS_EDIT_CALLBACK_PREFIX = "mytests:edit:";
 const MYTESTS_DUPLICATE_CALLBACK_PREFIX = "mytests:duplicate:";
+const MYTESTS_EXPORT_CALLBACK_PREFIX = "mytests:export:";
 const MYTESTS_NOOP_CALLBACK = "mytests:noop";
 
 const testRepository = new TestRepository();
@@ -89,8 +91,13 @@ const renderMyTestsPage = async (userId: string, page: number, lang: Language): 
       .text(t(lang, "mytests.btn.edit"), `${MYTESTS_EDIT_CALLBACK_PREFIX}${testId}`)
       .text(t(lang, "mytests.btn.duplicate"), `${MYTESTS_DUPLICATE_CALLBACK_PREFIX}${testId}:${currentPage}`);
 
+    keyboard
+      .row()
+      .text(t(lang, "mytests.btn.export_clean"), `${MYTESTS_EXPORT_CALLBACK_PREFIX}${testId}:clean`)
+      .text(t(lang, "mytests.btn.export_answers"), `${MYTESTS_EXPORT_CALLBACK_PREFIX}${testId}:answers`);
+
     if (participantCount >= 2) {
-      keyboard.text(t(lang, "leaderboard.btn"), `${LEADERBOARD_CALLBACK_PREFIX}${testId}`);
+      keyboard.row().text(t(lang, "leaderboard.btn"), `${LEADERBOARD_CALLBACK_PREFIX}${testId}`);
     }
 
     keyboard.row();
@@ -326,5 +333,33 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     const { text, keyboard } = await renderMyTestsPage(String(ctx.user._id), page, lang);
     await ctx.answerCallbackQuery({ text: t(lang, "mytests.duplicate.success", { title: newTest.title ?? newTitle }), show_alert: false });
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
+  });
+
+  bot.callbackQuery(/^mytests:export:[^:]+:(clean|answers)$/, async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+
+    const payload = ctx.callbackQuery.data.slice(MYTESTS_EXPORT_CALLBACK_PREFIX.length);
+    const [testId, mode] = payload.split(":");
+    const owned = await testRepository.findByIdAndCreator(testId ?? "", ctx.user._id);
+    if (!owned) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.not_owner"), show_alert: true });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: t(lang, "mytests.export.generating"), show_alert: false });
+
+    const includeAnswers = mode === "answers";
+    const pdfBuffer = await generateTestPDF(owned, lang, includeAnswers);
+    const rawTitle = owned.title?.trim() || t(lang, "common.untitledTest");
+    const safeTitle = rawTitle.replace(/[\\/:*?"<>|]/g, "_");
+
+    await ctx.replyWithDocument(
+      new InputFile(pdfBuffer, `${safeTitle}.pdf`),
+      { caption: t(lang, "mytests.export.caption", { title: rawTitle }) }
+    );
   });
 };

@@ -5,10 +5,10 @@ import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
 import { logger } from "../../shared/logger.js";
 import { ValidationError } from "../../shared/errors/ValidationError.js";
-import { DEFAULT_QUESTION_TYPES, type GenerateQuestionsInput, type QuestionType } from "../../shared/types/index.js";
+import { type GenerateQuestionsInput, type QuestionType } from "../../shared/types/index.js";
 import { resetSession, type BotContext, type UploadedFile } from "../types.js";
 import { transitionTo } from "../state-machine.js";
-import { t, type Language } from "../../shared/i18n/index.js";
+import { formatQuestionTypes, t, type Language } from "../../shared/i18n/index.js";
 import { TestRepository } from "../../db/repositories/test.repository.js";
 import { enterTestFlow } from "./test.handler.js";
 import { enterReviewFlow } from "./review.handler.js";
@@ -33,23 +33,72 @@ const FILE_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 const getFileSizeLimitBytes = (): number => (config.MAX_FILE_SIZE_MB ?? DEFAULT_MAX_FILE_SIZE_MB) * 1024 * 1024;
 
-const buildQuestionCountKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard()
+const formatTimerLabel = (seconds: number, lang: Language): string => {
+  switch (seconds) {
+    case 0: return t(lang, "upload.timer.btn.none");
+    case 15: return t(lang, "upload.timer.btn.15");
+    case 30: return t(lang, "upload.timer.btn.30");
+    case 60: return t(lang, "upload.timer.btn.60");
+    case 180: return t(lang, "upload.timer.btn.180");
+    default: return `${seconds}s`;
+  }
+};
+
+const getShuffleChoice = (shuffleQuestions: boolean, shuffleOptions: boolean): "both" | "questions" | "none" => {
+  if (shuffleQuestions && shuffleOptions) return "both";
+  if (shuffleQuestions) return "questions";
+  return "none";
+};
+
+const formatShuffleLabel = (choice: "both" | "questions" | "none", lang: Language): string => {
+  switch (choice) {
+    case "both": return t(lang, "upload.shuffle.both");
+    case "questions": return t(lang, "upload.shuffle.questions");
+    default: return t(lang, "upload.shuffle.none");
+  }
+};
+
+const buildQuestionCountKeyboard = (lang: Language, defaultCount?: number): InlineKeyboard => {
+  const keyboard = new InlineKeyboard();
+
+  if (defaultCount !== undefined) {
+    keyboard
+      .text(t(lang, "upload.keepDefaultCount", { count: defaultCount }), `${QUESTION_COUNT_CALLBACK_PREFIX}${defaultCount}`)
+      .row();
+  }
+
+  return keyboard
     .text("5", `${QUESTION_COUNT_CALLBACK_PREFIX}5`)
     .text("10", `${QUESTION_COUNT_CALLBACK_PREFIX}10`)
     .text("15", `${QUESTION_COUNT_CALLBACK_PREFIX}15`)
     .text("20", `${QUESTION_COUNT_CALLBACK_PREFIX}20`)
     .row()
     .text(t(lang, "upload.btn.custom"), `${QUESTION_COUNT_CALLBACK_PREFIX}custom`);
+};
 
-const buildQuestionTypesKeyboard = (selectedTypes: QuestionType[], lang: Language): InlineKeyboard => {
+const buildQuestionTypesKeyboard = (
+  selectedTypes: QuestionType[],
+  lang: Language,
+  defaultTypes?: QuestionType[]
+): InlineKeyboard => {
   const selected = new Set(selectedTypes);
   const toggleLabel = (type: QuestionType): string => {
     const typeKey = `upload.type.${type}` as Parameters<typeof t>[1];
     return `${selected.has(type) ? "[x]" : "[ ]"} ${t(lang, typeKey)}`;
   };
 
-  return new InlineKeyboard()
+  const keyboard = new InlineKeyboard();
+
+  if (defaultTypes?.length) {
+    keyboard
+      .text(
+        t(lang, "upload.keepDefaultTypes", { types: formatQuestionTypes(defaultTypes, lang) }),
+        QUESTION_TYPES_CONFIRM_CALLBACK
+      )
+      .row();
+  }
+
+  return keyboard
     .text(toggleLabel("mcq"), `${QUESTION_TYPES_CALLBACK_PREFIX}mcq`)
     .text(toggleLabel("truefalse"), `${QUESTION_TYPES_CALLBACK_PREFIX}truefalse`)
     .row()
@@ -65,16 +114,42 @@ const buildDoneAddingImagesKeyboard = (lang: Language): InlineKeyboard =>
 const buildRetryKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard().text(t(lang, "upload.btn.retryGeneration"), RETRY_GENERATION_CALLBACK);
 
-const buildShuffleKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard()
+const buildShuffleKeyboard = (
+  lang: Language,
+  defaultChoice?: "both" | "questions" | "none"
+): InlineKeyboard => {
+  const keyboard = new InlineKeyboard();
+
+  if (defaultChoice !== undefined) {
+    keyboard
+      .text(
+        t(lang, "upload.keepDefaultShuffle", { shuffle: formatShuffleLabel(defaultChoice, lang) }),
+        `${SHUFFLE_CALLBACK_PREFIX}${defaultChoice}`
+      )
+      .row();
+  }
+
+  return keyboard
     .text(t(lang, "upload.shuffle.both"), `${SHUFFLE_CALLBACK_PREFIX}both`)
     .row()
     .text(t(lang, "upload.shuffle.questions"), `${SHUFFLE_CALLBACK_PREFIX}questions`)
     .row()
     .text(t(lang, "upload.shuffle.none"), `${SHUFFLE_CALLBACK_PREFIX}none`);
+};
 
-const buildTimerKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard()
+const buildTimerKeyboard = (lang: Language, defaultSeconds?: number): InlineKeyboard => {
+  const keyboard = new InlineKeyboard();
+
+  if (defaultSeconds !== undefined) {
+    keyboard
+      .text(
+        t(lang, "upload.keepDefaultTimer", { timer: formatTimerLabel(defaultSeconds, lang) }),
+        `${TIMER_CALLBACK_PREFIX}${defaultSeconds}`
+      )
+      .row();
+  }
+
+  return keyboard
     .text(t(lang, "upload.timer.btn.15"), `${TIMER_CALLBACK_PREFIX}15`)
     .text(t(lang, "upload.timer.btn.30"), `${TIMER_CALLBACK_PREFIX}30`)
     .row()
@@ -82,6 +157,7 @@ const buildTimerKeyboard = (lang: Language): InlineKeyboard =>
     .text(t(lang, "upload.timer.btn.180"), `${TIMER_CALLBACK_PREFIX}180`)
     .row()
     .text(t(lang, "upload.timer.btn.none"), `${TIMER_CALLBACK_PREFIX}0`);
+};
 
 const buildActionKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard()
@@ -196,13 +272,11 @@ const buildUploadPromptKeyboard = (lang: Language): InlineKeyboard =>
 export const enterUploadFlow = async (ctx: BotContext): Promise<void> => {
   resetSession(ctx.session);
   // Pre-populate from user preferences so saved defaults carry into each new test.
-  if (ctx.user) {
-    ctx.session.questionCount = ctx.user.defaultQuestionCount ?? 10;
-    ctx.session.questionTypes = (ctx.user.defaultQuestionTypes as QuestionType[]) ?? DEFAULT_QUESTION_TYPES;
-    ctx.session.timeLimitSeconds = ctx.user.defaultTimeLimitSeconds ?? 0;
-    ctx.session.shuffleQuestions = ctx.user.defaultShuffleQuestions ?? false;
-    ctx.session.shuffleOptions = ctx.user.defaultShuffleOptions ?? false;
-  }
+  ctx.session.questionCount = ctx.user?.defaultQuestionCount ?? 10;
+  ctx.session.questionTypes = (ctx.user?.defaultQuestionTypes as QuestionType[] | undefined) ?? ["mcq", "truefalse"];
+  ctx.session.timeLimitSeconds = ctx.user?.defaultTimeLimitSeconds ?? 0;
+  ctx.session.shuffleQuestions = ctx.user?.defaultShuffleQuestions ?? false;
+  ctx.session.shuffleOptions = ctx.user?.defaultShuffleOptions ?? false;
   transitionTo(ctx.session, "uploading", "enterUploadFlow");
   ctx.session.uploadStep = "waiting_file";
   logger.info("Upload flow entered", { event: "upload.flow.enter", userId: ctx.from?.id });
@@ -468,7 +542,9 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
 const transitionToWaitingCount = async (ctx: BotContext): Promise<void> => {
   transitionTo(ctx.session, "configuring", "transitionToWaitingCount");
   ctx.session.uploadStep = "waiting_count";
-  await ctx.reply(t(ctx.lang(), "upload.howManyQuestions"), { reply_markup: buildQuestionCountKeyboard(ctx.lang()) });
+  await ctx.reply(t(ctx.lang(), "upload.howManyQuestions"), {
+    reply_markup: buildQuestionCountKeyboard(ctx.lang(), ctx.user?.defaultQuestionCount)
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -524,12 +600,12 @@ const handleWaitingCountCustom = async (ctx: BotContext): Promise<void> => {
 };
 
 const transitionToWaitingTypes = async (ctx: BotContext): Promise<void> => {
-  const defaultTypes = ctx.user?.defaultQuestionTypes ?? DEFAULT_QUESTION_TYPES;
+  const defaultTypes = (ctx.user?.defaultQuestionTypes as QuestionType[] | undefined) ?? ["mcq", "truefalse"];
   ctx.session.questionTypes = [...defaultTypes];
   ctx.session.uploadStep = "waiting_types";
 
   const message = await ctx.reply(t(ctx.lang(), "upload.whichTypes"), {
-    reply_markup: buildQuestionTypesKeyboard(ctx.session.questionTypes, ctx.lang())
+    reply_markup: buildQuestionTypesKeyboard(ctx.session.questionTypes, ctx.lang(), defaultTypes)
   });
   ctx.session.uploadTypesMessageId = message.message_id;
 };
@@ -540,7 +616,13 @@ const transitionToWaitingTypes = async (ctx: BotContext): Promise<void> => {
 
 const transitionToWaitingShuffle = async (ctx: BotContext): Promise<void> => {
   ctx.session.uploadStep = "waiting_shuffle";
-  await ctx.reply(t(ctx.lang(), "upload.shuffle.prompt"), { reply_markup: buildShuffleKeyboard(ctx.lang()) });
+  const defaultChoice = getShuffleChoice(
+    ctx.user?.defaultShuffleQuestions ?? false,
+    ctx.user?.defaultShuffleOptions ?? false
+  );
+  await ctx.reply(t(ctx.lang(), "upload.shuffle.prompt"), {
+    reply_markup: buildShuffleKeyboard(ctx.lang(), defaultChoice)
+  });
 };
 
 const handleWaitingShuffle = async (ctx: BotContext): Promise<void> => {
@@ -568,7 +650,9 @@ const handleWaitingShuffle = async (ctx: BotContext): Promise<void> => {
 
 const transitionToWaitingTimer = async (ctx: BotContext): Promise<void> => {
   ctx.session.uploadStep = "waiting_timer";
-  await ctx.reply(t(ctx.lang(), "upload.timer.prompt"), { reply_markup: buildTimerKeyboard(ctx.lang()) });
+  await ctx.reply(t(ctx.lang(), "upload.timer.prompt"), {
+    reply_markup: buildTimerKeyboard(ctx.lang(), ctx.user?.defaultTimeLimitSeconds)
+  });
 };
 
 const handleWaitingTimer = async (ctx: BotContext): Promise<void> => {
@@ -596,7 +680,18 @@ const buildTitleSkipKeyboard = (lang: Language): InlineKeyboard =>
 
 const transitionToWaitingTitle = async (ctx: BotContext): Promise<void> => {
   ctx.session.uploadStep = "waiting_title";
-  await ctx.reply(t(ctx.lang(), "upload.title.prompt"), { reply_markup: buildTitleSkipKeyboard(ctx.lang()) });
+  const lang = ctx.lang();
+  let prompt = t(lang, "upload.title.prompt");
+
+  if (ctx.user) {
+    const recentTests = await testRepository.findByCreatorPaginated(ctx.user._id, 1, 1);
+    const recentTitle = recentTests[0]?.title?.trim();
+    if (recentTitle) {
+      prompt = `${prompt}\n\n${t(lang, "upload.title.recentHint", { title: recentTitle })}`;
+    }
+  }
+
+  await ctx.reply(prompt, { reply_markup: buildTitleSkipKeyboard(lang) });
 };
 
 const handleWaitingTitle = async (ctx: BotContext): Promise<void> => {
@@ -663,7 +758,11 @@ const handleWaitingTypes = async (ctx: BotContext): Promise<void> => {
   const messageId = ctx.session.uploadTypesMessageId;
   if (messageId) {
     await ctx.api.editMessageReplyMarkup(ctx.chatId!, messageId, {
-      reply_markup: buildQuestionTypesKeyboard(ctx.session.questionTypes, ctx.lang())
+      reply_markup: buildQuestionTypesKeyboard(
+        ctx.session.questionTypes,
+        ctx.lang(),
+        ctx.user?.defaultQuestionTypes as QuestionType[] | undefined
+      )
     });
   }
 };

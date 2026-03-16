@@ -40,7 +40,7 @@ export const createQuestionPrompt = (input: GenerateQuestionsInput): string => {
 };
 
 export const stripMarkdownFences = (value: string): string =>
-  value.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  (value ?? "").replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
 
 const isQuestionType = (value: unknown): value is QuestionType =>
   value === "mcq" || value === "truefalse" || value === "short" || value === "fill";
@@ -102,18 +102,70 @@ const normalizeQuestionIds = (questions: Question[]): Question[] => {
 const normalizeQuestionTexts = (questions: Question[]): Question[] =>
   questions.map((q) => ({
     ...q,
-    question: normalizeWhitespace(q.question),
-    correctAnswer: normalizeWhitespace(q.correctAnswer),
+    question: normalizeWhitespace(q.question ?? ""),
+    correctAnswer: normalizeWhitespace(q.correctAnswer ?? ""),
     explanation: q.explanation ? normalizeWhitespace(q.explanation) : q.explanation,
     options: q.options
       ? {
-          A: normalizeWhitespace(q.options.A),
-          B: normalizeWhitespace(q.options.B),
-          C: normalizeWhitespace(q.options.C),
-          D: normalizeWhitespace(q.options.D)
+          A: normalizeWhitespace(q.options.A ?? ""),
+          B: normalizeWhitespace(q.options.B ?? ""),
+          C: normalizeWhitespace(q.options.C ?? ""),
+          D: normalizeWhitespace(q.options.D ?? "")
         }
       : undefined
   }));
+
+const sanitizeQuestion = (value: unknown, index: number): Question | null => {
+  if (!value || typeof value !== "object") {
+    logger.warn("Skipping non-object AI question", {
+      event: "ai.provider.question.skipped",
+      index,
+      reason: "not_object"
+    });
+    return null;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  const rawType = candidate.type;
+  if (!isQuestionType(rawType)) {
+    logger.warn("Skipping AI question with invalid type", {
+      event: "ai.provider.question.skipped",
+      index,
+      reason: "invalid_type",
+      type: rawType
+    });
+    return null;
+  }
+
+  const question: Question = {
+    id: typeof candidate.id === "string" && candidate.id.trim() ? candidate.id : `q_${index}_${Date.now()}`,
+    type: rawType,
+    question: typeof candidate.question === "string" ? candidate.question : "",
+    correctAnswer: typeof candidate.correctAnswer === "string" ? candidate.correctAnswer : "",
+    explanation: typeof candidate.explanation === "string" ? candidate.explanation : undefined
+  };
+
+  if (rawType === "mcq") {
+    const options = candidate.options as Record<string, unknown> | undefined;
+    question.options = {
+      A: typeof options?.A === "string" ? options.A : "",
+      B: typeof options?.B === "string" ? options.B : "",
+      C: typeof options?.C === "string" ? options.C : "",
+      D: typeof options?.D === "string" ? options.D : ""
+    };
+  }
+
+  if (!question.question || !question.correctAnswer) {
+    logger.warn("AI question missing required text fields; using safe fallbacks", {
+      event: "ai.provider.question.sanitized",
+      index,
+      hasQuestion: Boolean(question.question),
+      hasCorrectAnswer: Boolean(question.correctAnswer)
+    });
+  }
+
+  return question;
+};
 
 export const parseQuestionsResponse = (raw: string): Question[] => {
   let parsed: unknown;
@@ -129,11 +181,19 @@ export const parseQuestionsResponse = (raw: string): Question[] => {
     throw new AIError("AI provider returned malformed JSON", error);
   }
 
-  if (!Array.isArray(parsed) || !parsed.every(assertQuestion)) {
+  if (!Array.isArray(parsed)) {
     throw new AIError("AI provider returned an invalid question array", parsed);
   }
 
-  return normalizeQuestionTexts(normalizeQuestionIds(parsed));
+  const sanitized = parsed
+    .map((item, index) => sanitizeQuestion(item, index))
+    .filter((item): item is Question => item !== null);
+
+  if (sanitized.length === 0) {
+    throw new AIError("AI provider returned an invalid question array", parsed);
+  }
+
+  return normalizeQuestionTexts(normalizeQuestionIds(sanitized));
 };
 
 export const extractTextFromInput = async (input: GenerateQuestionsInput): Promise<string> => {

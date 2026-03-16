@@ -46,6 +46,8 @@ export type BotSession = {
   state: BotSessionState;
   language?: Language;
   sessionRecovered?: boolean;
+  settingsAwaitingCustomCount?: boolean;
+  settingsReturnToMenu?: boolean;
   uploadedFiles?: UploadedFile[];
   uploadSourceType?: "pdf" | "images" | "text";
   shuffleQuestions?: boolean;
@@ -108,6 +110,8 @@ export const createInitialSession = (): BotSession => ({
   state: "idle",
   language: undefined,
   sessionRecovered: undefined,
+  settingsAwaitingCustomCount: undefined,
+  settingsReturnToMenu: undefined,
   uploadedFiles: undefined,
   uploadedText: undefined,
   settingsDraftTypes: undefined,

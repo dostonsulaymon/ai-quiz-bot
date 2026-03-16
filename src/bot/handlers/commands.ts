@@ -17,6 +17,7 @@ import { TestSessionRepository } from "../../db/repositories/test-session.reposi
 import type { UserStats } from "../../db/repositories/test-session.repository.js";
 import { GroupSessionRepository } from "../../db/repositories/group-session.repository.js";
 import { userCache } from "../middlewares/userMiddleware.js";
+import { safeEditMessage } from "../utils/telegram.js";
 
 const commands: BotCommand[] = [
   { command: "start", description: "Start the bot and open a shared test" },
@@ -419,6 +420,12 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
         ? t(newLang, "start.welcome_new", { name: ctx.from?.first_name ?? "" })
         : t(newLang, "start.welcome_returning");
       await ctx.reply(text, { reply_markup: buildWelcomeKeyboard(newLang) });
+    }
+
+    if (ctx.session.settingsReturnToMenu && ctx.user) {
+      ctx.session.settingsReturnToMenu = undefined;
+      const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), newLang);
+      await safeEditMessage(ctx, text, { reply_markup: keyboard });
     }
   });
 
