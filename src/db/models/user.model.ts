@@ -26,6 +26,18 @@ const userSchema = new Schema(
       type: Number,
       default: 10
     },
+    defaultTimeLimitSeconds: {
+      type: Number,
+      default: 0
+    },
+    defaultShuffleQuestions: {
+      type: Boolean,
+      default: false
+    },
+    defaultShuffleOptions: {
+      type: Boolean,
+      default: false
+    },
     totalTestsTaken: {
       type: Number,
       default: 0

@@ -60,6 +60,7 @@ export type BotSession = {
   activeTestSlotId?: string;
   pendingJoinCode?: string;
   uploadedText?: string;
+  settingsDraftTypes?: QuestionType[];
   // Upload sub-state
   uploadStep?: UploadStep;
   uploadTypesMessageId?: number;
@@ -109,6 +110,7 @@ export const createInitialSession = (): BotSession => ({
   sessionRecovered: undefined,
   uploadedFiles: undefined,
   uploadedText: undefined,
+  settingsDraftTypes: undefined,
   uploadSourceType: undefined,
   shuffleQuestions: undefined,
   shuffleOptions: undefined,

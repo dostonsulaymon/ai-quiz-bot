@@ -6,6 +6,7 @@ import { logger } from "../../shared/logger.js";
 import { registerHistoryHandler } from "./history.handler.js";
 import { registerMyTestsHandler } from "./mytests.handler.js";
 import { registerLeaderboardHandler, renderLeaderboard } from "./leaderboard.handler.js";
+import { registerSettingsHandler, buildSettingsPage } from "./settings.handler.js";
 import { registerGroupHandlers, startGroupQuiz, cancelGroupQuiz, stopGroupQuiz } from "./group.handler.js";
 import type { BotContext } from "../types.js";
 import { resetSession } from "../types.js";
@@ -24,6 +25,7 @@ const commands: BotCommand[] = [
   { command: "mytests", description: "List tests you created" },
   { command: "history", description: "View your past test sessions" },
   { command: "stats", description: "View your overall performance statistics" },
+  { command: "settings", description: "Configure your default test preferences" },
   { command: "leaderboard", description: "View leaderboard for a test by share code" },
   { command: "language", description: "Change language / Tilni o'zgartirish" },
   { command: "stop", description: "Stop the current group quiz (group chats only)" },
@@ -42,6 +44,7 @@ const START_JOIN_CALLBACK = "start:join";
 const START_LANGUAGE_CALLBACK = "start:language";
 const START_HELP_CALLBACK = "start:help";
 const START_STATS_CALLBACK = "start:stats";
+const START_SETTINGS_CALLBACK = "start:settings";
 const testRepository = new TestRepository();
 const userRepository = new UserRepository();
 const testSessionRepository = new TestSessionRepository();
@@ -103,6 +106,7 @@ const buildWelcomeKeyboard = (lang: Language): InlineKeyboard =>
     .text(t(lang, "start.btn.join"), START_JOIN_CALLBACK)
     .row()
     .text(t(lang, "start.btn.stats"), START_STATS_CALLBACK)
+    .text(t(lang, "start.btn.settings"), START_SETTINGS_CALLBACK)
     .row()
     .text(t(lang, "start.btn.language"), START_LANGUAGE_CALLBACK)
     .text(t(lang, "start.btn.help"), START_HELP_CALLBACK);
@@ -505,6 +509,16 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.reply(buildStatsMessage(stats, testsCreated, lang));
   });
 
+  bot.command("settings", async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.reply(t(lang, "error.userLoad"));
+      return;
+    }
+    const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
+    await ctx.reply(text, { reply_markup: keyboard });
+  });
+
   // Welcome screen button callbacks
   bot.callbackQuery(START_NEWTEST_CALLBACK, async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -542,8 +556,20 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.reply(buildStatsMessage(stats, testsCreated, lang));
   });
 
+  bot.callbackQuery(START_SETTINGS_CALLBACK, async (ctx) => {
+    const lang = ctx.lang();
+    await ctx.answerCallbackQuery();
+    if (!ctx.user) {
+      await ctx.reply(t(lang, "error.userLoad"));
+      return;
+    }
+    const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
+    await ctx.reply(text, { reply_markup: keyboard });
+  });
+
   registerMyTestsHandler(bot);
   registerHistoryHandler(bot);
   registerLeaderboardHandler(bot);
   registerGroupHandlers(bot);
+  registerSettingsHandler(bot);
 };

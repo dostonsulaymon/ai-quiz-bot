@@ -192,9 +192,17 @@ const buildGenerateInput = (
 const buildUploadPromptKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard().text(t(lang, "upload.text.btn"), TEXT_START_CALLBACK);
 
-/** Enter the upload flow: reset session, set state, send prompt. */
+/** Enter the upload flow: reset session, pre-populate user defaults, set state, send prompt. */
 export const enterUploadFlow = async (ctx: BotContext): Promise<void> => {
   resetSession(ctx.session);
+  // Pre-populate from user preferences so saved defaults carry into each new test.
+  if (ctx.user) {
+    ctx.session.questionCount = ctx.user.defaultQuestionCount ?? 10;
+    ctx.session.questionTypes = (ctx.user.defaultQuestionTypes as QuestionType[]) ?? DEFAULT_QUESTION_TYPES;
+    ctx.session.timeLimitSeconds = ctx.user.defaultTimeLimitSeconds ?? 0;
+    ctx.session.shuffleQuestions = ctx.user.defaultShuffleQuestions ?? false;
+    ctx.session.shuffleOptions = ctx.user.defaultShuffleOptions ?? false;
+  }
   transitionTo(ctx.session, "uploading", "enterUploadFlow");
   ctx.session.uploadStep = "waiting_file";
   logger.info("Upload flow entered", { event: "upload.flow.enter", userId: ctx.from?.id });

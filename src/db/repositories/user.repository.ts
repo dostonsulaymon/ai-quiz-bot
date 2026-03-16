@@ -45,4 +45,17 @@ export class UserRepository {
   async incrementTotalTestsTaken(id: string | Types.ObjectId): Promise<UserDocument | null> {
     return UserModel.findByIdAndUpdate(id, { $inc: { totalTestsTaken: 1 } }, { new: true }).exec();
   }
+
+  async updatePreferences(
+    userId: string | Types.ObjectId,
+    prefs: {
+      defaultQuestionCount?: number;
+      defaultQuestionTypes?: string[];
+      defaultTimeLimitSeconds?: number;
+      defaultShuffleQuestions?: boolean;
+      defaultShuffleOptions?: boolean;
+    }
+  ): Promise<void> {
+    await UserModel.updateOne({ _id: userId }, { $set: prefs }).exec();
+  }
 }
