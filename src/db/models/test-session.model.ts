@@ -25,14 +25,12 @@ const testSessionSchema = new Schema({
   testId: {
     type: Schema.Types.ObjectId,
     ref: "Test",
-    required: true,
-    index: true  // needed for countByTestId queries
+    required: true
   },
   userId: {
     type: Schema.Types.ObjectId,
     ref: "User",
-    required: true,
-    index: true  // needed for findByUser / countByUser queries
+    required: true
   },
   answers: {
     type: [answerSchema],
@@ -65,6 +63,9 @@ const testSessionSchema = new Schema({
 }, {
   timestamps: false
 });
+
+testSessionSchema.index({ userId: 1, status: 1 });
+testSessionSchema.index({ testId: 1, status: 1 });
 
 export type TestSession = InferSchemaType<typeof testSessionSchema> & {
   _id: Types.ObjectId;

@@ -22,6 +22,8 @@ type Config = {
   MAX_FILE_SIZE_MB: number;
   RATE_LIMIT_GENERATIONS_PER_HOUR: number;
   RATE_LIMIT_DAILY_MAX: number;
+  AI_TIMEOUT_MS: number;
+  SESSION_TTL_SECONDS: number;
 };
 
 const PROVIDERS = ["claude", "gemini", "ollama"] as const;
@@ -83,5 +85,7 @@ export const config: Config = {
   MAX_QUESTIONS_PER_TEST: parseNumber("MAX_QUESTIONS_PER_TEST"),
   MAX_FILE_SIZE_MB: parseNumber("MAX_FILE_SIZE_MB"),
   RATE_LIMIT_GENERATIONS_PER_HOUR: parseNumber("RATE_LIMIT_GENERATIONS_PER_HOUR"),
-  RATE_LIMIT_DAILY_MAX: parseNumber("RATE_LIMIT_DAILY_MAX")
+  RATE_LIMIT_DAILY_MAX: parseNumber("RATE_LIMIT_DAILY_MAX"),
+  AI_TIMEOUT_MS: Number(process.env.AI_TIMEOUT_MS) || 60_000,
+  SESSION_TTL_SECONDS: Number(process.env.SESSION_TTL_SECONDS) || 604_800
 };

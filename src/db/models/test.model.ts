@@ -3,10 +3,10 @@ import { DEFAULT_QUESTION_TYPES } from "../../shared/types/index.js";
 
 const questionOptionsSchema = new Schema(
   {
-    A: { type: String, required: true },
-    B: { type: String, required: true },
-    C: { type: String, required: true },
-    D: { type: String, required: true }
+    A: { type: String, required: false },
+    B: { type: String, required: false },
+    C: { type: String, required: false },
+    D: { type: String, required: false }
   },
   { _id: false }
 );
@@ -80,6 +80,18 @@ const testSchema = new Schema(
     isActive: {
       type: Boolean,
       default: true
+    },
+    shuffleQuestions: {
+      type: Boolean,
+      default: false
+    },
+    shuffleOptions: {
+      type: Boolean,
+      default: false
+    },
+    timeLimitSeconds: {
+      type: Number,
+      default: 0
     }
   },
   {

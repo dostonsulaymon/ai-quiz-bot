@@ -1,17 +1,15 @@
 import { Bot, session } from "grammy";
-import { conversations, createConversation } from "@grammyjs/conversations";
 import type { Redis } from "ioredis";
 import { config } from "../config/index.js";
 import { registerCommandHandlers } from "./handlers/commands.js";
 import { registerErrorMiddleware } from "./middlewares/errorMiddleware.js";
 import { userMiddleware } from "./middlewares/userMiddleware.js";
-import { reviewScene, REVIEW_CONVERSATION_NAME } from "./scenes/review.scene.js";
-import { testScene, TEST_CONVERSATION_NAME } from "./scenes/test.scene.js";
-import { uploadScene, UPLOAD_CONVERSATION_NAME } from "./scenes/upload.scene.js";
 import { RedisSessionStorage } from "./storage/redis-session.storage.js";
 import type { BotContext, BotSession } from "./types.js";
 import { createInitialSession } from "./types.js";
+import { stateRouter } from "./router.js";
 import { logger } from "../shared/logger.js";
+import { t } from "../shared/i18n/index.js";
 
 export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
@@ -30,7 +28,7 @@ export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
 
       return `${ctx.from.id}:${ctx.chat.id}`;
     },
-    storage: new RedisSessionStorage<BotSession>(redis, undefined, (): BotSession => ({
+    storage: new RedisSessionStorage<BotSession>(redis, config.SESSION_TTL_SECONDS, (): BotSession => ({
       ...createInitialSession(),
       sessionRecovered: true
     }))
@@ -39,53 +37,43 @@ export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
   bot.use(attachRedis);
   bot.use(sessionMiddleware);
 
+  // Set a default lang() before userMiddleware runs so any middleware that fires
+  // before user detection has a safe fallback. userMiddleware overwrites it with
+  // the real detected language.
+  bot.use((ctx, next) => {
+    ctx.lang = () => "en";
+    return next();
+  });
+
+  // userMiddleware detects language and overwrites ctx.lang with the real value.
+  bot.use(userMiddleware);
+
+  // Session recovery reply now runs after userMiddleware so it can use ctx.lang().
   bot.use(async (ctx, next) => {
     if (ctx.session.sessionRecovered) {
       ctx.session.sessionRecovered = false;
-      await ctx.reply("Something went wrong with your session. Starting fresh! 🔄");
+      await ctx.reply(t(ctx.lang(), "error.generic"));
     }
 
     await next();
   });
 
-  // userMiddleware must run before conversations so that ctx.user is populated
-  // inside conversation bodies (conversations intercept the update and never
-  // pass it further down the middleware chain).
-  bot.use(userMiddleware);
-
-  bot.use(
-    conversations({
-      plugins: [attachRedis]
-    })
-  );
-  bot.use(createConversation(uploadScene, UPLOAD_CONVERSATION_NAME));
-  bot.use(createConversation(reviewScene, REVIEW_CONVERSATION_NAME));
-  bot.use(createConversation(testScene, TEST_CONVERSATION_NAME));
   bot.use(async (ctx, next) => {
+    logger.info("update received", {
+      updateType: Object.keys(ctx.update).find((k) => k !== "update_id") ?? "unknown",
+      callbackData: ctx.callbackQuery?.data ?? null,
+      sessionState: ctx.session.state,
+      chatId: ctx.chat?.id,
+      lang: ctx.lang()
+    });
     await next();
-
-    // Only auto-restore a suspended conversation when no conversation is
-    // currently active for this update.  Checking AFTER next() means the
-    // conversations middleware has already had a chance to resume an existing
-    // conversation; if none was active we may need to re-enter one whose state
-    // was persisted across a bot restart.
-    if (Object.keys(ctx.conversation.active()).length > 0) {
-      return;
-    }
-
-    if (ctx.session.state === "reviewing" && (ctx.session.draftQuestions?.length ?? 0) > 0) {
-      await ctx.conversation.enter(REVIEW_CONVERSATION_NAME);
-      return;
-    }
-
-    if (ctx.session.state === "testing" && ctx.session.activeTestId) {
-      await ctx.conversation.enter(TEST_CONVERSATION_NAME);
-    }
   });
+
+  bot.use(stateRouter);
 
   bot.callbackQuery("error:retry", async (ctx) => {
     await ctx.answerCallbackQuery();
-    await ctx.reply("Please retry the last step when you’re ready.");
+    await ctx.reply(t(ctx.lang(), "commands.cancelled"));
   });
 
   await registerCommandHandlers(bot);

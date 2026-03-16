@@ -37,8 +37,8 @@ export class TestSessionRepository {
     id: string | Types.ObjectId,
     answer: QuestionAnswer
   ): Promise<TestSessionDocument | null> {
-    return TestSessionModel.findByIdAndUpdate(
-      id,
+    return TestSessionModel.findOneAndUpdate(
+      { _id: id, "answers.questionId": { $ne: answer.questionId } },
       { $push: { answers: answer } },
       { new: true }
     ).exec();
@@ -93,5 +93,32 @@ export class TestSessionRepository {
 
   async countByTestId(testId: string | Types.ObjectId): Promise<number> {
     return TestSessionModel.countDocuments({ testId }).exec();
+  }
+
+  async findByIdAndUser(
+    id: string | Types.ObjectId,
+    userId: Types.ObjectId
+  ): Promise<TestSessionDocument | null> {
+    return TestSessionModel.findOne({ _id: id, userId }).populate("testId").exec();
+  }
+
+  async abandon(sessionId: string | Types.ObjectId): Promise<void> {
+    await TestSessionModel.findByIdAndUpdate(sessionId, {
+      status: "abandoned",
+      completedAt: new Date()
+    }).exec();
+  }
+
+  async countByTestIds(testIds: Types.ObjectId[]): Promise<Map<string, number>> {
+    const results = await TestSessionModel.aggregate<{ _id: Types.ObjectId; count: number }>([
+      { $match: { testId: { $in: testIds }, status: "completed" } },
+      { $group: { _id: "$testId", count: { $sum: 1 } } }
+    ]).exec();
+
+    const map = new Map<string, number>();
+    for (const result of results) {
+      map.set(result._id.toString(), result.count);
+    }
+    return map;
   }
 }

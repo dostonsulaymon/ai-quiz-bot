@@ -1,6 +1,7 @@
 import type { IAIProvider } from "../ai.interface.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { AIError } from "../../shared/errors/AIError.js";
 import { logger } from "../../shared/logger.js";
 import type { GenerateQuestionsInput, Question } from "../../shared/types/index.js";
 import { createQuestionPrompt, parseQuestionsResponse } from "./base.provider.js";
@@ -25,25 +26,39 @@ export class ClaudeProvider implements IAIProvider {
       questionCount: input.questionCount,
       contentType: input.content.type
     });
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": config.CLAUDE_API_KEY!,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: config.CLAUDE_MODEL!,
-        max_tokens: 4096,
-        system: createQuestionPrompt(input),
-        messages: [
-          {
-            role: "user",
-            content: this.buildContentBlocks(input)
-          }
-        ]
-      })
-    });
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), config.AI_TIMEOUT_MS);
+
+    let response: Response;
+    try {
+      response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": config.CLAUDE_API_KEY!,
+          "anthropic-version": "2023-06-01"
+        },
+        body: JSON.stringify({
+          model: config.CLAUDE_MODEL!,
+          max_tokens: 4096,
+          system: createQuestionPrompt(input),
+          messages: [
+            {
+              role: "user",
+              content: this.buildContentBlocks(input)
+            }
+          ]
+        })
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new AIError("Claude request timed out", { timeoutMs: config.AI_TIMEOUT_MS }, false);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
 
     const payload = (await response.json()) as ClaudeResponse;
 

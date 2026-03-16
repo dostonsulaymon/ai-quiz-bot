@@ -1,6 +1,7 @@
 import type { IAIProvider } from "../ai.interface.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { AIError } from "../../shared/errors/AIError.js";
 import { logger } from "../../shared/logger.js";
 import type { GenerateQuestionsInput, Question } from "../../shared/types/index.js";
 import { createQuestionPrompt, extractTextFromInput, parseQuestionsResponse } from "./base.provider.js";
@@ -22,17 +23,31 @@ export class OllamaProvider implements IAIProvider {
     });
     const extractedText = await extractTextFromInput(input);
 
-    const response = await fetch(`${config.OLLAMA_BASE_URL!}/api/generate`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        model: config.OLLAMA_MODEL!,
-        prompt: `${createQuestionPrompt(input)}\n\nContent:\n${extractedText}`,
-        stream: false
-      })
-    });
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), config.AI_TIMEOUT_MS);
+
+    let response: Response;
+    try {
+      response = await fetch(`${config.OLLAMA_BASE_URL!}/api/generate`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          model: config.OLLAMA_MODEL!,
+          prompt: `${createQuestionPrompt(input)}\n\nContent:\n${extractedText}`,
+          stream: false
+        })
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new AIError("Ollama request timed out", { timeoutMs: config.AI_TIMEOUT_MS }, false);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
 
     const payload = (await response.json()) as OllamaResponse;
 

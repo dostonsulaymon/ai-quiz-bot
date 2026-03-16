@@ -29,6 +29,11 @@ const userSchema = new Schema(
     totalTestsTaken: {
       type: Number,
       default: 0
+    },
+    language: {
+      type: String,
+      enum: ["en", "uz"],
+      default: "en"
     }
   },
   {

@@ -11,6 +11,7 @@ const bootstrap = async (): Promise<void> => {
 
   const bot = await createBot(redis);
   await bot.start({
+    allowed_updates: ["message", "callback_query"],
     onStart: () => {
       console.info(`[bot] Quiz Bot started in ${config.NODE_ENV} mode`);
     }

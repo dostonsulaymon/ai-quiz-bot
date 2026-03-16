@@ -1,6 +1,7 @@
 import type { IAIProvider } from "../ai.interface.js";
 import { config } from "../../config/index.js";
 import { AppError } from "../../shared/errors/AppError.js";
+import { AIError } from "../../shared/errors/AIError.js";
 import { logger } from "../../shared/logger.js";
 import type { GenerateQuestionsInput, Question } from "../../shared/types/index.js";
 import { createQuestionPrompt, parseQuestionsResponse } from "./base.provider.js";
@@ -31,32 +32,46 @@ export class GeminiProvider implements IAIProvider {
     const url = new URL(
       `https://generativelanguage.googleapis.com/v1beta/models/${config.GEMINI_MODEL!}:generateContent`
     );
-    url.searchParams.set("key", config.GEMINI_API_KEY!);
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: this.buildParts(input)
-          }
-        ],
-        systemInstruction: {
-          parts: [
-            {
-              text: createQuestionPrompt(input)
-            }
-          ]
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), config.AI_TIMEOUT_MS);
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          "x-goog-api-key": config.GEMINI_API_KEY!
         },
-        generationConfig: {
-          temperature: 0.2
-        }
-      })
-    });
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: this.buildParts(input)
+            }
+          ],
+          systemInstruction: {
+            parts: [
+              {
+                text: createQuestionPrompt(input)
+              }
+            ]
+          },
+          generationConfig: {
+            temperature: 0.2
+          }
+        })
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new AIError("Gemini request timed out", { timeoutMs: config.AI_TIMEOUT_MS }, false);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
 
     const payload = (await response.json()) as GeminiResponse;
 

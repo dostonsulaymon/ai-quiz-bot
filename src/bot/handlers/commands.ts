@@ -5,11 +5,15 @@ import { UserRepository } from "../../db/repositories/user.repository.js";
 import { logger } from "../../shared/logger.js";
 import { registerHistoryHandler } from "./history.handler.js";
 import { registerMyTestsHandler } from "./mytests.handler.js";
+import { registerLeaderboardHandler, renderLeaderboard } from "./leaderboard.handler.js";
+import { registerGroupHandlers, startGroupQuiz, cancelGroupQuiz } from "./group.handler.js";
 import type { BotContext } from "../types.js";
-import { REVIEW_CONVERSATION_NAME } from "../scenes/review.scene.js";
-import { TEST_CONVERSATION_NAME } from "../scenes/test.scene.js";
 import { resetSession } from "../types.js";
-import { UPLOAD_CONVERSATION_NAME } from "../scenes/upload.scene.js";
+import { enterUploadFlow } from "./upload.handler.js";
+import { enterTestFlow } from "./test.handler.js";
+import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
+import { TestSessionRepository } from "../../db/repositories/test-session.repository.js";
+import { userCache } from "../middlewares/userMiddleware.js";
 
 const commands: BotCommand[] = [
   { command: "start", description: "Start the bot and open a shared test" },
@@ -17,26 +21,19 @@ const commands: BotCommand[] = [
   { command: "join", description: "Join a shared test using a share code" },
   { command: "mytests", description: "List tests you created" },
   { command: "history", description: "View your past test sessions" },
+  { command: "leaderboard", description: "View leaderboard for a test by share code" },
+  { command: "language", description: "Change language / Tilni o'zgartirish" },
   { command: "cancel", description: "Cancel the current flow and reset progress" },
   { command: "help", description: "Show available commands" }
 ];
 
-const helpText = [
-  "Available commands:",
-  "/start - Welcome message and open a shared test via deep link",
-  "/newtest - Start creating a new quiz",
-  "/join [CODE] - Join a shared quiz by share code",
-  "/mytests - View your created tests (coming soon)",
-  "/history - View your completed sessions (coming soon)",
-  "/cancel - Reset the current session",
-  "/help - Show this help message"
-].join("\n");
-
 const JOIN_AWAITING_CODE = "__awaiting_join_code__";
 const JOIN_START_CALLBACK_PREFIX = "join:start:";
 const JOIN_CANCEL_CALLBACK = "join:cancel";
+const LANG_CALLBACK_PREFIX = "lang:";
 const testRepository = new TestRepository();
 const userRepository = new UserRepository();
+const testSessionRepository = new TestSessionRepository();
 
 const normalizeShareCode = (value: string | undefined): string | undefined => {
   const code = value?.trim().toUpperCase().replace(/^TEST-/, "");
@@ -45,96 +42,90 @@ const normalizeShareCode = (value: string | undefined): string | undefined => {
 
 const isShareCode = (value: string | undefined): value is string => Boolean(value && /^[A-Z0-9]{6}$/.test(value));
 
-const formatQuestionTypes = (types: string[]): string =>
-  [...new Set(types)].map((type) => {
-    switch (type) {
-      case "mcq":
-        return "MCQ";
-      case "truefalse":
-        return "True/False";
-      case "short":
-        return "Short";
-      case "fill":
-        return "Fill";
-      default:
-        return type;
-    }
-  }).join(", ");
-
-const buildPreviewKeyboard = (testId: string): InlineKeyboard =>
+const buildPreviewKeyboard = (testId: string, lang: ReturnType<BotContext["lang"]>): InlineKeyboard =>
   new InlineKeyboard()
-    .text("▶️ Start Test", `${JOIN_START_CALLBACK_PREFIX}${testId}`)
-    .text("❌ Cancel", JOIN_CANCEL_CALLBACK);
+    .text(t(lang, "commands.btn.startTest"), `${JOIN_START_CALLBACK_PREFIX}${testId}`)
+    .text(t(lang, "btn.cancel"), JOIN_CANCEL_CALLBACK);
 
 const showTestPreview = async (ctx: BotContext, testId: string): Promise<void> => {
+  const lang = ctx.lang();
   const test = await testRepository.findById(testId);
   if (!test || !test.isActive) {
-    await ctx.reply("This test link is expired or invalid ❌");
+    await ctx.reply(t(lang, "commands.testLinkInvalid"));
     return;
   }
 
   const creator = await userRepository.findById(test.creatorId);
-  const creatorLabel = creator?.username ? `@${creator.username}` : "Unknown creator";
-  const title = test.title?.trim() || "Untitled Test";
-  const questionTypes = formatQuestionTypes(test.questions.map((question) => question.type));
+  const creatorLabel = creator?.username ? `@${creator.username}` : t(lang, "common.unknownCreator");
+  const title = test.title?.trim() || t(lang, "common.untitledTest");
+  const questionTypes = formatQuestionTypes(test.questions.map((question) => question.type), lang);
 
   await ctx.reply(
     [
-      `📝 Test: ${title}`,
-      `Questions: ${test.questions.length}`,
-      `Types: ${questionTypes}`,
-      `Created by: ${creatorLabel}`
+      t(lang, "commands.testPreview.title", { title }),
+      t(lang, "commands.testPreview.questions", { n: test.questions.length }),
+      t(lang, "commands.testPreview.types", { types: questionTypes }),
+      t(lang, "commands.testPreview.creator", { creator: creatorLabel })
     ].join("\n"),
-    { reply_markup: buildPreviewKeyboard(String(test._id)) }
+    { reply_markup: buildPreviewKeyboard(String(test._id), lang) }
   );
 };
 
 const previewSharedTest = async (ctx: BotContext, shareCode: string): Promise<void> => {
   const test = await testRepository.findByShareCode(shareCode);
   if (!test) {
-    await ctx.reply("This test link is expired or invalid ❌");
+    await ctx.reply(t(ctx.lang(), "commands.testLinkInvalid"));
     return;
   }
 
   await showTestPreview(ctx, String(test._id));
 };
 
-const startPreviewedTest = async (ctx: BotContext, testId: string): Promise<void> => {
-  // Exit all conversations before resetting session to avoid stale grammY history.
-  // This version of @grammyjs/conversations has no zero-arg exit() overload — call per name.
-  await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME);
-  await ctx.conversation.exit(REVIEW_CONVERSATION_NAME);
-  await ctx.conversation.exit(TEST_CONVERSATION_NAME);
-  resetSession(ctx.session);
-  ctx.session.activeTestId = testId;
-  ctx.session.state = "testing";
-  // Ensure leftover sessionId/index from a previous run do not bleed in.
-  ctx.session.sessionId = undefined;
-  ctx.session.currentQuestionIndex = 0;
-  await ctx.conversation.enter(TEST_CONVERSATION_NAME);
+const buildLanguageKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "language.btn.en"), `${LANG_CALLBACK_PREFIX}en`)
+    .text(t(lang, "language.btn.uz"), `${LANG_CALLBACK_PREFIX}uz`);
+
+const handleJoinByCode = async (ctx: BotContext, raw: string): Promise<void> => {
+  const shareCode = normalizeShareCode(raw);
+  if (!isShareCode(shareCode)) {
+    ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
+    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+    return;
+  }
+  ctx.session.pendingJoinCode = undefined;
+  await previewSharedTest(ctx, shareCode);
 };
 
 export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<void> => {
   await bot.api.setMyCommands(commands);
 
   bot.command("start", async (ctx) => {
-    const deepLinkCode = normalizeShareCode(typeof ctx.match === "string" ? ctx.match : undefined);
+    const payload = (ctx.match as string | undefined) ?? ctx.message?.text?.split(" ")[1];
     logger.info("Start command received", {
       event: "command.start",
       userId: ctx.from?.id,
-      hasDeepLink: isShareCode(deepLinkCode)
+      hasDeepLink: Boolean(payload?.startsWith("TEST-"))
     });
+
+    if (ctx.session.state === "testing") {
+      if (ctx.session.sessionId) {
+        await testSessionRepository.abandon(ctx.session.sessionId);
+      }
+      if (ctx.session.testSubState !== "completed") {
+        await import("../middlewares/rateLimitMiddleware.js").then(({ releaseActiveTestSessionSlot }) =>
+          releaseActiveTestSessionSlot(ctx)
+        );
+      }
+    }
 
     resetSession(ctx.session);
 
-    if (isShareCode(deepLinkCode)) {
-      await previewSharedTest(ctx, deepLinkCode);
-      return;
+    if (payload?.startsWith("TEST-")) {
+      return handleJoinByCode(ctx, payload);
     }
 
-    await ctx.reply(
-      "Welcome to Quiz Bot.\nUse /newtest to create a quiz or /join SHARECODE to take a shared one."
-    );
+    await ctx.reply(t(ctx.lang(), "commands.welcome"));
   });
 
   bot.command("newtest", async (ctx) => {
@@ -142,34 +133,45 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       event: "command.newtest",
       userId: ctx.from?.id
     });
-    // Exit all active conversations before resetting state so grammY can clean
-    // up its internal conversation history before we wipe the session.
-    await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME);
-    await ctx.conversation.exit(REVIEW_CONVERSATION_NAME);
-    await ctx.conversation.exit(TEST_CONVERSATION_NAME);
-    resetSession(ctx.session);
-    await ctx.conversation.enter(UPLOAD_CONVERSATION_NAME);
-    // NOTE: the previous code checked ctx.session.state === "reviewing" here,
-    // but resetSession() just set state to "idle", so that branch was dead code.
-    // Removed to avoid confusion.
+    await enterUploadFlow(ctx);
   });
 
   bot.command("join", async (ctx) => {
-    const shareCode = normalizeShareCode(typeof ctx.match === "string" ? ctx.match : undefined);
+    const raw = typeof ctx.match === "string" ? ctx.match : undefined;
     logger.info("Join command received", {
       event: "command.join",
       userId: ctx.from?.id,
-      code: shareCode ?? null
+      code: raw ?? null
     });
 
-    if (!isShareCode(shareCode)) {
-      ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
-      await ctx.reply("Send me the 6-character share code.");
+    // In group chats, /join starts a group quiz instead of a private test
+    const chatType = ctx.chat?.type;
+    if (chatType === "group" || chatType === "supergroup") {
+      if (!raw) {
+        await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+        return;
+      }
+      const shareCode = normalizeShareCode(raw);
+      if (!isShareCode(shareCode)) {
+        await ctx.reply(t(ctx.lang(), "commands.invalidCode"));
+        return;
+      }
+      const test = await testRepository.findByShareCode(shareCode);
+      if (!test) {
+        await ctx.reply(t(ctx.lang(), "commands.testLinkInvalid"));
+        return;
+      }
+      await startGroupQuiz(ctx, String(test._id));
       return;
     }
 
-    ctx.session.pendingJoinCode = undefined;
-    await previewSharedTest(ctx, shareCode);
+    if (!raw) {
+      ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
+      await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+      return;
+    }
+
+    await handleJoinByCode(ctx, raw);
   });
 
   bot.command("cancel", async (ctx) => {
@@ -177,18 +179,78 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       event: "command.cancel",
       userId: ctx.from?.id
     });
-    // Exit all active conversations first so grammY clears its history, then
-    // reset the session — if the order is reversed, the session is wiped before
-    // the conversation exit logic can reference it.
-    await ctx.conversation.exit(UPLOAD_CONVERSATION_NAME);
-    await ctx.conversation.exit(REVIEW_CONVERSATION_NAME);
-    await ctx.conversation.exit(TEST_CONVERSATION_NAME);
+
+    // In group chats, /cancel ends the active group quiz
+    const chatType = ctx.chat?.type;
+    if (chatType === "group" || chatType === "supergroup") {
+      await cancelGroupQuiz(String(ctx.chat!.id));
+      await ctx.reply(t(ctx.lang(), "commands.cancelled"));
+      return;
+    }
+
+    if (ctx.session.state === "testing") {
+      if (ctx.session.sessionId) {
+        await testSessionRepository.abandon(ctx.session.sessionId);
+      }
+      if (ctx.session.testSubState !== "completed") {
+        await import("../middlewares/rateLimitMiddleware.js").then(({ releaseActiveTestSessionSlot }) =>
+          releaseActiveTestSessionSlot(ctx)
+        );
+      }
+
+      const answered = ctx.session.currentQuestionIndex ?? 0;
+      const correct = ctx.session.testCorrectCount ?? 0;
+      const total = ctx.session.testQuestions?.length ?? 0;
+
+      if (answered > 0 && ctx.session.testCorrectCount !== undefined) {
+        const lang = ctx.lang();
+        const pct = Math.round((correct / answered) * 100);
+        await ctx.reply(
+          [
+            t(lang, "test.cancelled.summary"),
+            t(lang, "test.complete.separator"),
+            t(lang, "test.cancelled.answered", { answered, total }),
+            t(lang, "test.cancelled.correct", { correct }),
+            t(lang, "test.cancelled.score", { pct }),
+            t(lang, "test.complete.separator"),
+            t(lang, "test.cancelled.not_saved")
+          ].join("\n")
+        );
+        resetSession(ctx.session);
+        return;
+      }
+    }
+
     resetSession(ctx.session);
-    await ctx.reply("Your current flow has been cancelled and your session is back to idle.");
+    await ctx.reply(t(ctx.lang(), "commands.cancelled"));
   });
 
   bot.command("help", async (ctx) => {
-    await ctx.reply(helpText);
+    await ctx.reply(t(ctx.lang(), "commands.help"));
+  });
+
+  bot.command("language", async (ctx) => {
+    const lang = ctx.lang();
+    logger.info("Language command received", { event: "command.language", userId: ctx.from?.id });
+    await ctx.reply(t(lang, "language.prompt"), { reply_markup: buildLanguageKeyboard(lang) });
+  });
+
+  bot.callbackQuery(new RegExp(`^${LANG_CALLBACK_PREFIX}(en|uz)$`), async (ctx) => {
+    const newLang = ctx.callbackQuery.data.slice(LANG_CALLBACK_PREFIX.length) as Language;
+    await ctx.answerCallbackQuery();
+
+    if (ctx.user) {
+      await userRepository.updateSettings(ctx.user._id, { language: newLang });
+      if (ctx.from) userCache.delete(ctx.from.id);
+    }
+
+    ctx.session.language = newLang;
+    ctx.lang = () => newLang;
+
+    const confirmKey = newLang === "uz" ? "language.selected.uz" : "language.selected.en";
+    await ctx.reply(t(newLang, confirmKey));
+
+    logger.info("Language changed", { event: "command.language.changed", userId: ctx.from?.id, lang: newLang });
   });
 
   bot.on("message:text", async (ctx, next) => {
@@ -199,7 +261,7 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     const shareCode = normalizeShareCode(ctx.msg.text);
     if (!isShareCode(shareCode)) {
-      await ctx.reply("That code doesn't look right. Please send a 6-character code like ABC123.");
+      await ctx.reply(t(ctx.lang(), "commands.invalidCode"));
       return;
     }
 
@@ -210,15 +272,43 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   bot.callbackQuery(new RegExp(`^${JOIN_START_CALLBACK_PREFIX}`), async (ctx) => {
     const testId = ctx.callbackQuery.data.slice(JOIN_START_CALLBACK_PREFIX.length);
     await ctx.answerCallbackQuery();
-    await startPreviewedTest(ctx, testId);
+    resetSession(ctx.session);
+    await enterTestFlow(ctx, testId);
   });
 
   bot.callbackQuery(JOIN_CANCEL_CALLBACK, async (ctx) => {
     await ctx.answerCallbackQuery();
     ctx.session.pendingJoinCode = undefined;
-    await ctx.reply("Join cancelled.");
+    await ctx.reply(t(ctx.lang(), "commands.joinCancelled"));
+  });
+
+  bot.command("leaderboard", async (ctx) => {
+    const lang = ctx.lang();
+    const raw = typeof ctx.match === "string" ? ctx.match.trim() : undefined;
+
+    if (!raw) {
+      await ctx.reply(t(lang, "commands.leaderboardPromptCode"));
+      return;
+    }
+
+    const shareCode = normalizeShareCode(raw);
+    if (!isShareCode(shareCode)) {
+      await ctx.reply(t(lang, "commands.invalidCode"));
+      return;
+    }
+
+    const test = await testRepository.findByShareCode(shareCode);
+    if (!test) {
+      await ctx.reply(t(lang, "commands.testLinkInvalid"));
+      return;
+    }
+
+    const { text } = await renderLeaderboard(String(test._id), ctx.user?._id ? String(ctx.user._id) : undefined, lang);
+    await ctx.reply(text);
   });
 
   registerMyTestsHandler(bot);
   registerHistoryHandler(bot);
+  registerLeaderboardHandler(bot);
+  registerGroupHandlers(bot);
 };

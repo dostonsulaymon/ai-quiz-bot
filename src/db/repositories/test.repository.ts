@@ -13,6 +13,9 @@ type CreateTestInput = {
   questions: Question[];
   sourceType: TestSourceType;
   questionCount: number;
+  shuffleQuestions?: boolean;
+  shuffleOptions?: boolean;
+  timeLimitSeconds?: number;
 };
 
 const isDuplicateKeyError = (error: unknown): boolean =>
@@ -101,7 +104,36 @@ export class TestRepository {
     return TestModel.countDocuments({ creatorId, isActive: true }).exec();
   }
 
+  async findByIdAndCreator(
+    id: string | Types.ObjectId,
+    creatorId: string | Types.ObjectId
+  ): Promise<TestDocument | null> {
+    return TestModel.findOne({ _id: id, creatorId, deletedAt: null, isActive: true }).exec();
+  }
+
   async softDelete(id: string | Types.ObjectId): Promise<TestDocument | null> {
     return TestModel.findByIdAndUpdate(id, { isActive: false }, { new: true }).exec();
+  }
+
+  async updateTest(
+    id: string | Types.ObjectId,
+    updates: {
+      title?: string;
+      questions: Question[];
+      questionCount: number;
+      shuffleQuestions: boolean;
+      shuffleOptions: boolean;
+    }
+  ): Promise<TestDocument | null> {
+    const $set: Record<string, unknown> = {
+      questions: updates.questions,
+      questionCount: updates.questionCount,
+      shuffleQuestions: updates.shuffleQuestions,
+      shuffleOptions: updates.shuffleOptions
+    };
+    if (updates.title !== undefined) {
+      $set["title"] = updates.title;
+    }
+    return TestModel.findByIdAndUpdate(id, { $set }, { new: true }).exec();
   }
 }

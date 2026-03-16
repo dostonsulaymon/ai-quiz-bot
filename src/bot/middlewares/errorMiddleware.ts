@@ -2,6 +2,7 @@ import { InlineKeyboard, type BotError, type Bot as GrammyBot } from "grammy";
 import { AppError } from "../../shared/errors/AppError.js";
 import { logger } from "../../shared/logger.js";
 import type { BotContext } from "../types.js";
+import { t } from "../../shared/i18n/index.js";
 
 const RETRY_CALLBACK = "error:retry";
 
@@ -13,7 +14,7 @@ const toAppError = (error: unknown): AppError => {
   return new AppError("Unhandled application error", {
     statusCode: 500,
     code: "UNEXPECTED_ERROR",
-    userMessage: "Something went wrong on my side. Please try again in a moment.",
+    userMessage: "GENERIC",
     isRetryable: false,
     details: error
   });
@@ -21,6 +22,7 @@ const toAppError = (error: unknown): AppError => {
 
 export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
   bot.catch(async (error: BotError<BotContext>) => {
+    const lang = error.ctx.lang();
     const appError = toAppError(error.error);
     logger.error("Unhandled bot error", {
       code: appError.code,
@@ -32,10 +34,15 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
 
     try {
       const keyboard = appError.isRetryable
-        ? new InlineKeyboard().text("🔄 Try Again", RETRY_CALLBACK)
+        ? new InlineKeyboard().text(t(lang, "error.btn.tryAgain"), RETRY_CALLBACK)
         : undefined;
 
-      await error.ctx.reply(appError.userMessage, {
+      const message =
+        appError.code === "UNEXPECTED_ERROR" || appError.userMessage === "GENERIC"
+          ? t(lang, "error.generic")
+          : (appError.userMessage ?? t(lang, "error.generic"));
+
+      await error.ctx.reply(message, {
         reply_markup: keyboard
       });
     } catch (replyError) {

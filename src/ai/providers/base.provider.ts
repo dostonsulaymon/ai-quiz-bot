@@ -25,6 +25,7 @@ export const createQuestionPrompt = (input: GenerateQuestionsInput): string => {
 
   return [
     "Generate quiz questions from the provided content.",
+    "Detect the language of the provided content and generate all questions, answers, and explanations in that same language.",
     `Return exactly ${input.questionCount} question(s).`,
     `Only use these question types: ${allowedTypes}.`,
     "Return ONLY a JSON array matching this schema:",

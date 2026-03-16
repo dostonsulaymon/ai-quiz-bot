@@ -7,6 +7,7 @@ type UpdateUserSettingsInput = {
   firstName?: string;
   defaultQuestionTypes?: QuestionType[];
   defaultQuestionCount?: number;
+  language?: string;
 };
 
 export class UserRepository {
