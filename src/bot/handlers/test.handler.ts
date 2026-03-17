@@ -632,8 +632,6 @@ const handleChoiceAnswer = async (
   if (!answer?.startsWith(ANSWER_CALLBACK_PREFIX)) {
     if (ctx.callbackQuery) {
       await ctx.answerCallbackQuery({ text: t(lang, "test.chooseAnswerToast"), show_alert: false });
-    } else {
-      await ctx.reply(t(lang, "test.useAnswerButtons"));
     }
     return;
   }
@@ -1125,6 +1123,10 @@ export const processPrivateChoiceAnswer = async (
     session.testCorrectCount = (session.testCorrectCount ?? 0) + 1;
   }
 
+  if (session.testQuestionMessageId) {
+    await ctx.api.stopPoll(chatId, session.testQuestionMessageId).catch(() => undefined);
+  }
+
   session.currentQuestionIndex = questionIndex + 1;
   session.questionStartedAt = undefined;
   session.testQuestionMessageId = undefined;
@@ -1134,11 +1136,17 @@ export const processPrivateChoiceAnswer = async (
   cancelQuestionTimeout(Number(chatId));
 
   // Set up a mock context for sendCurrentQuestion
-  Object.defineProperty(ctx, "chat", { get: () => ({ id: Number(chatId), type: "private", first_name: user?.first_name }) });
-  Object.defineProperty(ctx, "from", { get: () => user });
-  Object.defineProperty(ctx, "session", { get: () => session, set: (v) => Object.assign(session, v) });
+  const mockCtx = {
+    api: ctx.api,
+    redis: ctx.redis,
+    chat: { id: Number(chatId), type: "private", first_name: user?.first_name },
+    from: user,
+    session,
+    lang: ctx.lang,
+    reply: async (text: string, kwargs?: any) => ctx.api.sendMessage(chatId, text, kwargs)
+  } as unknown as BotContext;
   
-  await sendCurrentQuestion(ctx);
+  await sendCurrentQuestion(mockCtx);
   
   await storage.write(sessionKey, session);
 };

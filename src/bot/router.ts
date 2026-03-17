@@ -14,7 +14,7 @@ import { t } from "../shared/i18n/index.js";
  */
 export const stateRouter = async (ctx: BotContext, next: () => Promise<void>): Promise<void> => {
   const text = ctx.message?.text;
-  if (text?.startsWith("/start") || text?.startsWith("/cancel") || text?.startsWith("/language")) {
+  if (text?.startsWith("/")) {
     return next();
   }
 
