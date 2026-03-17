@@ -361,6 +361,7 @@ const handleEditingAnswer = async (ctx: BotContext): Promise<void> => {
   ctx.session.reviewEditQuestionIndex = undefined;
 
   logger.info("Review question edited", { event: "review.question.edited", userId: ctx.from?.id, questionIndex });
+  await ctx.reply(t(lang, "review.answer_updated"));
 
   const messageId = ctx.session.reviewMessageId;
   if (messageId) {

@@ -3,9 +3,11 @@ import { uploadRouterFull } from "./handlers/upload.handler.js";
 import { reviewRouter, enterReviewFlow } from "./handlers/review.handler.js";
 import { testRouter, enterTestFlow } from "./handlers/test.handler.js";
 import { editRouter } from "./handlers/edit.handler.js";
+import { NAV_MAIN_MENU_CALLBACK } from "./handlers/commands.js";
 import { resetSession } from "./types.js";
 import { VALID_TRANSITIONS } from "./state-machine.js";
 import { t } from "../shared/i18n/index.js";
+import { buildMainMenuKeyboard } from "./utils/keyboards.js";
 
 /**
  * Top-level state router.
@@ -16,6 +18,15 @@ export const stateRouter = async (ctx: BotContext, next: () => Promise<void>): P
   const text = ctx.message?.text;
   if (text?.startsWith("/")) {
     return next();
+  }
+
+  if (ctx.callbackQuery?.data === NAV_MAIN_MENU_CALLBACK) {
+    await ctx.answerCallbackQuery();
+    resetSession(ctx.session);
+    await ctx.reply(t(ctx.lang(), "test.mainMenu"), {
+      reply_markup: buildMainMenuKeyboard(ctx.lang())
+    });
+    return;
   }
 
   const state = ctx.session.state;

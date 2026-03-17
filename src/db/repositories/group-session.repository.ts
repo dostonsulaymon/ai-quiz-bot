@@ -30,6 +30,10 @@ export class GroupSessionRepository {
     return GroupSessionModel.findOne({ chatId, status: "active" }).exec();
   }
 
+  async findById(id: string | Types.ObjectId): Promise<GroupSessionDocument | null> {
+    return GroupSessionModel.findById(id).exec();
+  }
+
   /**
    * Atomically records a user's answer for a question.
    * Returns true if the answer was newly recorded, false if the user already answered.

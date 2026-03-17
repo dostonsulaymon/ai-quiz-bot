@@ -8,7 +8,7 @@ import type { TestDocument } from "../../db/models/test.model.js";
 import type { GroupSessionDocument } from "../../db/models/group-session.model.js";
 import type { Question } from "../../shared/types/index.js";
 import { t, type Language } from "../../shared/i18n/index.js";
-import { safeEditMessage, safeEditMessageViaApi } from "../utils/telegram.js";
+import { safeEditMessage, safeEditMessageViaApi, safeDeleteMessage } from "../utils/telegram.js";
 import { formatQuestionDisplay, formatOptionDisplay } from "../utils/format.js";
 import { activePollSessions } from "../types.js";
 import { ValidationError } from "../../shared/errors/ValidationError.js";
@@ -78,7 +78,7 @@ const buildFullQuestionText = (
   let text = buildQuestionText(question, index, total, lang);
   if (timeLimitSeconds > 0) {
     if (remaining !== undefined) {
-      const timerKey = remaining > 30 ? "test.timer_remaining" : remaining > 10 ? "test.timer_warning" : "test.timer_urgent";
+      const timerKey = remaining > 10 ? "test.timer_remaining" : remaining > 5 ? "test.timer_warning" : "test.timer_urgent";
       text += `\n${t(lang, timerKey, { seconds: remaining })}`;
     } else {
       text += `\n${t(lang, "test.timer_label", { seconds: timeLimitSeconds })}`;
@@ -104,7 +104,7 @@ const buildQuestionKeyboard = (
     kb.text(t(lang, "test.btn.true"), `${answerBase}True`).text(t(lang, "test.btn.false"), `${answerBase}False`).row();
   }
 
-  kb.text(t(lang, "group.btn.next", { answered: answeredCount }), `${GROUP_NEXT_PREFIX}${sessionId}:${qIdx}`);
+  kb.text(t(lang, "group.btn.show_results"), `${GROUP_NEXT_PREFIX}${sessionId}:${qIdx}`);
   return kb;
 };
 
@@ -218,21 +218,27 @@ const sendGroupQuestionViaApi = async (
     const pollQuestion = questionDisplay.slice(0, 300);
     const openPeriod = test.timeLimitSeconds > 0 ? Math.min(600, Math.max(5, test.timeLimitSeconds)) : undefined;
 
+    const nextButton = new InlineKeyboard().text(t(lang, "group.btn.show_results"), `${GROUP_NEXT_PREFIX}${String(session._id)}:${idx}`);
+
     msg = await api.sendPoll(chatId, pollQuestion, pollOptions, {
       type: "quiz",
       correct_option_id: correctOptionId,
       is_anonymous: false,
-      open_period: openPeriod
+      open_period: openPeriod,
+      explanation: question.explanation ? question.explanation.slice(0, 200) : undefined,
+      reply_markup: nextButton
     });
 
     activePollSessions.set(msg.poll.id, {
       mode: "group",
       sessionId: String(session._id),
       chatId,
-      questionIndex: idx
+      userId: Number(session.startedBy),
+      questionIndex: idx,
+      isGroup: true
     });
   } else {
-    const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount);
+    const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount, test.timeLimitSeconds);
     const keyboard = buildQuestionKeyboard(String(session._id), question, idx, lang, answeredCount);
     msg = await api.sendMessage(chatId, text, { reply_markup: keyboard });
   }
@@ -371,21 +377,27 @@ const sendGroupQuestion = async (
     const pollQuestion = questionDisplay.slice(0, 300);
     const openPeriod = test.timeLimitSeconds > 0 ? Math.min(600, Math.max(5, test.timeLimitSeconds)) : undefined;
 
+    const nextButton = new InlineKeyboard().text(t(lang, "group.btn.show_results"), `${GROUP_NEXT_PREFIX}${String(session._id)}:${idx}`);
+
     msg = await api.sendPoll(chatId, pollQuestion, pollOptions, {
       type: "quiz",
       correct_option_id: correctOptionId,
       is_anonymous: false,
-      open_period: openPeriod
+      open_period: openPeriod,
+      explanation: question.explanation ? question.explanation.slice(0, 200) : undefined,
+      reply_markup: nextButton
     });
 
     activePollSessions.set(msg.poll.id, {
       mode: "group",
       sessionId: String(session._id),
       chatId,
-      questionIndex: idx
+      userId: Number(session.startedBy),
+      questionIndex: idx,
+      isGroup: true
     });
   } else {
-    const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount);
+    const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount, test.timeLimitSeconds);
     const keyboard = buildQuestionKeyboard(String(session._id), question, idx, lang, answeredCount);
     msg = await api.sendMessage(chatId, text, { reply_markup: keyboard });
   }
@@ -426,6 +438,14 @@ const completeGroupSession = async (
   test: TestDocument,
   lang: Language
 ): Promise<void> => {
+  const chatId = String(ctx.chat!.id);
+  const api = ctx.api;
+
+  if (session.progressMessageId) {
+    await safeDeleteMessage(api, chatId, session.progressMessageId);
+    await groupSessionRepository.setProgressMessageId(session._id, null);
+  }
+
   const { questions } = test;
   const testId = String(session.testId);
 
@@ -860,15 +880,60 @@ export const registerGroupHandlers = (bot: Bot<BotContext>): void => {
     }
     await next();
   });
+};
+// ---------------------------------------------------------------------------
+// Native Poll Answer
+// ---------------------------------------------------------------------------
 
-  bot.on("poll_answer", async (ctx: BotContext, next: () => Promise<void>) => {
-    const pollId = ctx.pollAnswer?.poll_id;
-    if (!pollId) return next();
-    const sessionMeta = activePollSessions.get(pollId);
-    if (sessionMeta?.mode === "group") {
-      await processGroupChoiceAnswer(ctx, sessionMeta);
-    } else {
-      await next();
-    }
+export const handleGroupPollAnswer = async (
+  ctx: BotContext,
+  pollSession: import("../types.js").ActivePollSession
+): Promise<void> => {
+  const pollAnswer = ctx.pollAnswer;
+  if (!pollAnswer || !pollAnswer.user) return;
+  const user = pollAnswer.user;
+
+  const { sessionId, chatId, questionIndex } = pollSession;
+  
+  const questions = await resolveGroupQuestions(String(sessionId));
+  if (!questions) return;
+  
+  const question = questions[questionIndex] as Question | undefined;
+  if (!question || (question.type !== "mcq" && question.type !== "truefalse")) return;
+
+  const optionId = pollAnswer.option_ids[0];
+  let userAnswer = "";
+  if (question.type === "mcq") {
+    userAnswer = optionId === 0 ? "A" : optionId === 1 ? "B" : optionId === 2 ? "C" : optionId === 3 ? "D" : "";
+  } else {
+    userAnswer = optionId === 0 ? "True" : "False";
+  }
+
+  const isCorrect = userAnswer === question.correctAnswer;
+
+  await groupSessionRepository.addAnswer(
+    sessionId,
+    question.id,
+    String(user.id),
+    user.first_name,
+    userAnswer,
+    isCorrect,
+    user.username
+  );
+
+  logger.info("Group native poll answer recorded", { 
+    event: "group.poll_answer.recorded", 
+    userId: user.id, 
+    sessionId, 
+    questionIndex, 
+    isCorrect 
   });
+};
+
+const resolveGroupQuestions = async (sessionId: string): Promise<Question[] | null> => {
+  const session = await groupSessionRepository.findById(sessionId);
+  if (!session) return null;
+  const test = await testRepository.findById(String(session.testId));
+  if (!test) return null;
+  return test.questions as Question[];
 };

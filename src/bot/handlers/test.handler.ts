@@ -16,9 +16,10 @@ import { t, type Language } from "../../shared/i18n/index.js";
 import { LeaderboardRepository } from "../../db/repositories/leaderboard.repository.js";
 import { RedisSessionStorage } from "../storage/redis-session.storage.js";
 import { config } from "../../config/index.js";
-import { safeEditMessageViaApi } from "../utils/telegram.js";
+import { safeEditMessageViaApi, safeDeleteMessage } from "../utils/telegram.js";
 import { formatQuestionDisplay, formatOptionDisplay } from "../utils/format.js";
 import { activePollSessions } from "../types.js";
+import { buildMainMenuKeyboard } from "../utils/keyboards.js";
 
 const ANSWER_CALLBACK_PREFIX = "test:answer:";
 const SELF_GRADE_CALLBACK_PREFIX = "test:self:";
@@ -166,7 +167,9 @@ const runAutoAdvance = async (params: AutoAdvanceParams): Promise<void> => {
       t(lang, "test.complete.correctCount", { n: correctCount }),
       t(lang, "test.complete.wrongCount", { n: wrongCount })
     ];
-    await api.sendMessage(chatId, lines.join("\n"));
+    await api.sendMessage(chatId, lines.join("\n"), {
+      reply_markup: buildCompletionKeyboard(lang, session.activeTestId)
+    });
 
     session.currentQuestionIndex = totalQuestions;
     session.questionStartedAt = undefined;
@@ -227,9 +230,9 @@ const formatQuestionText = (question: Question, index: number, total: number, la
   if (timeLimitSeconds > 0) {
     if (remaining !== undefined) {
       const timerLine =
-        remaining > 30
+        remaining > 10
           ? t(lang, "test.timer_remaining", { seconds: remaining })
-          : remaining > 10
+          : remaining > 5
             ? t(lang, "test.timer_warning", { seconds: remaining })
             : t(lang, "test.timer_urgent", { seconds: remaining });
       lines.push(timerLine);
@@ -460,7 +463,7 @@ const sendCurrentQuestion = async (ctx: BotContext): Promise<void> => {
   const timeLimitSeconds = ctx.session.timeLimitSeconds ?? 0;
   
   if (ctx.session.testProgressMessageId && ctx.chat) {
-    await ctx.api.deleteMessage(ctx.chat.id, ctx.session.testProgressMessageId).catch(() => undefined);
+    await safeDeleteMessage(ctx.api, ctx.chat.id, ctx.session.testProgressMessageId);
     ctx.session.testProgressMessageId = undefined;
   }
 
@@ -509,13 +512,14 @@ const sendCurrentQuestion = async (ctx: BotContext): Promise<void> => {
       mode: "private",
       sessionId: ctx.session.sessionId!,
       chatId: String(ctx.chat.id),
+      userId: ctx.from!.id,
       questionIndex: index
     });
 
   } else {
     const replyMarkup = undefined;
     
-    const message = await ctx.reply(formatQuestionText(question, index, questions.length, lang, timeLimitSeconds), { reply_markup: replyMarkup });
+    const message = await ctx.reply(formatQuestionText(question, index, questions.length, lang, timeLimitSeconds, timeLimitSeconds), { reply_markup: replyMarkup });
     ctx.session.testQuestionMessageId = message.message_id;
     ctx.session.questionStartedAt = Date.now();
     ctx.session.testSubState = "answering";
@@ -822,6 +826,15 @@ const completeTest = async (ctx: BotContext, totalQuestions: number): Promise<vo
 
   const score = Math.round((correctCount / totalQuestions) * 100);
 
+  if (ctx.session.testProgressMessageId && ctx.chat) {
+    await safeDeleteMessage(ctx.api, ctx.chat.id, ctx.session.testProgressMessageId);
+    ctx.session.testProgressMessageId = undefined;
+  }
+  if (ctx.session.testQuestionMessageId && ctx.chat) {
+    await safeDeleteMessage(ctx.api, ctx.chat.id, ctx.session.testQuestionMessageId);
+    ctx.session.testQuestionMessageId = undefined;
+  }
+
   const [completed] = await Promise.all([
     testSessionRepository.complete(sessionId, { score, correctCount, totalQuestions, completedAt: new Date() }),
     userRepository.incrementTotalTestsTaken(ctx.user._id)
@@ -931,7 +944,9 @@ const handleCompleted = async (ctx: BotContext): Promise<void> => {
   if (data === MAIN_MENU_CALLBACK) {
     await ctx.answerCallbackQuery();
     resetSession(ctx.session);
-    await ctx.reply(t(lang, "test.mainMenu"));
+    await ctx.reply(t(lang, "test.mainMenu"), {
+      reply_markup: buildMainMenuKeyboard(lang)
+    });
     return;
   }
 
@@ -1076,7 +1091,7 @@ const buildAnswerReviewPage = async (
 // Native Poll Answer Handlers
 // ---------------------------------------------------------------------------
 
-export const processPrivateChoiceAnswer = async (
+export const handlePollAnswer = async (
   ctx: BotContext,
   pollSession: import("../types.js").ActivePollSession
 ): Promise<void> => {
@@ -1098,7 +1113,8 @@ export const processPrivateChoiceAnswer = async (
   const test = await testRepository.findById(activeTestId);
   if (!test) return;
 
-  const question = test.questions[questionIndex] as Question | undefined;
+  const questions = test.questions as Question[];
+  const question = questions[questionIndex] as Question | undefined;
   if (!question || (question.type !== "mcq" && question.type !== "truefalse")) return;
 
   const optionId = pollAnswer.option_ids[0];
@@ -1127,39 +1143,30 @@ export const processPrivateChoiceAnswer = async (
     await ctx.api.stopPoll(chatId, session.testQuestionMessageId).catch(() => undefined);
   }
 
+  // Update session state before moving to next question
   session.currentQuestionIndex = questionIndex + 1;
   session.questionStartedAt = undefined;
   session.testQuestionMessageId = undefined;
   session.testPollId = undefined;
 
+  // Cleanup active poll tracking and timer
   activePollSessions.delete(pollAnswer.poll_id);
   cancelQuestionTimeout(Number(chatId));
+
+  // Save updated session to storage before advancing
+  await storage.write(sessionKey, session);
 
   // Set up a mock context for sendCurrentQuestion
   const mockCtx = {
     api: ctx.api,
     redis: ctx.redis,
-    chat: { id: Number(chatId), type: "private", first_name: user?.first_name },
+    chat: { id: Number(chatId), type: "private" },
     from: user,
     session,
-    lang: ctx.lang,
+    lang: () => session.language ?? "en",
     reply: async (text: string, kwargs?: any) => ctx.api.sendMessage(chatId, text, kwargs)
   } as unknown as BotContext;
   
+  // Advance immediately
   await sendCurrentQuestion(mockCtx);
-  
-  await storage.write(sessionKey, session);
-};
-
-export const registerTestPollHandler = (bot: import("grammy").Bot<BotContext>): void => {
-  bot.on("poll_answer", async (ctx: BotContext, next: () => Promise<void>) => {
-    const pollId = ctx.pollAnswer?.poll_id;
-    if (!pollId) return next();
-    const sessionMeta = activePollSessions.get(pollId);
-    if (sessionMeta?.mode === "private") {
-      await processPrivateChoiceAnswer(ctx, sessionMeta);
-    } else {
-      await next();
-    }
-  });
 };

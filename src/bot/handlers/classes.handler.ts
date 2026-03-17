@@ -24,6 +24,8 @@ const MYCLASSES_ADD_TEST_PAGE_PREFIX = "myclasses:add_test_page:";
 const MYCLASSES_ADD_PICK_PREFIX = "myclasses:add_pick:";
 const MYCLASSES_PREVIEW_BROWSE_PREFIX = "myclasses:preview:browse:";
 const MYCLASSES_PREVIEW_TAKE_PREFIX = "myclasses:preview:take:";
+const MYCLASSES_SHARE_BACK_CLASS_PREFIX = "myclasses:share_back_class:";
+const MYCLASSES_SHARE_BACK_LIST_PREFIX = "myclasses:share_back_list:";
 const MYCLASSES_NOOP_CB = "myclasses:noop";
 
 const classRepository = new ClassRepository();
@@ -80,7 +82,7 @@ const renderMyClassesPage = async (
   classes.forEach((item) => {
     const classId = String(item._id);
     keyboard
-      .text(t(lang, "myclasses.btn.view"), `${MYCLASSES_OPEN_PREFIX}${classId}:${currentPage}`)
+      .text(t(lang, "myclasses.btn.open_class"), `${MYCLASSES_OPEN_PREFIX}${classId}:${currentPage}`)
       .text(t(lang, "myclasses.btn.edit"), `${MYCLASSES_EDIT_PREFIX}${classId}:${currentPage}`)
       .text(t(lang, "myclasses.btn.share"), `${MYCLASSES_SHARE_PREFIX}${classId}:${currentPage}`)
       .text(t(lang, "myclasses.btn.delete"), `${MYCLASSES_DELETE_PREFIX}${classId}:${currentPage}`)
@@ -363,16 +365,22 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
       return;
     }
     const payload = ctx.callbackQuery.data.slice(MYCLASSES_SHARE_PREFIX.length);
-    const [classId] = payload.split(":");
+    const [classId, pageValue] = payload.split(":");
     const owned = await classRepository.findByIdAndCreator(classId ?? "", ctx.user._id);
     if (!owned) {
       await ctx.answerCallbackQuery({ text: t(lang, "error.not_owner"), show_alert: true });
       return;
     }
+    const page = Number(pageValue ?? "1");
+    ctx.session.activeClassId = String(owned._id);
     const shareCode = await classRepository.ensureShareCode(owned._id);
     const link = `https://t.me/${ctx.me.username ?? "your_bot"}?start=${shareCode}`;
     await ctx.answerCallbackQuery();
-    await ctx.reply(t(lang, "myclasses.share.link", { code: shareCode, link }));
+    await ctx.reply(t(lang, "myclasses.share.link", { code: shareCode, link }), {
+      reply_markup: new InlineKeyboard()
+        .text(t(lang, "deadend.btn.back_to_class"), `${MYCLASSES_SHARE_BACK_CLASS_PREFIX}${page}`)
+        .text(t(lang, "deadend.btn.my_classes"), `${MYCLASSES_SHARE_BACK_LIST_PREFIX}${page}`)
+    });
   });
 
   bot.callbackQuery(new RegExp(`^${MYCLASSES_DELETE_PREFIX}`), async (ctx) => {
@@ -483,6 +491,40 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     await enterTestFlow(ctx, testId);
   });
 
+  bot.callbackQuery(new RegExp(`^${MYCLASSES_SHARE_BACK_CLASS_PREFIX}`), async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+    const classId = ctx.session.activeClassId;
+    if (!classId) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: false });
+      return;
+    }
+    const page = Number(ctx.callbackQuery.data.slice(MYCLASSES_SHARE_BACK_CLASS_PREFIX.length));
+    const result = await renderClassView(classId, ctx.user._id, page, lang);
+    await ctx.answerCallbackQuery();
+    if (!result) {
+      await ctx.reply(t(lang, "error.not_owner"));
+      return;
+    }
+    await safeEditMessage(ctx, result.text, { reply_markup: result.keyboard });
+  });
+
+  bot.callbackQuery(new RegExp(`^${MYCLASSES_SHARE_BACK_LIST_PREFIX}`), async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+    ctx.session.activeClassId = undefined;
+    const page = Number(ctx.callbackQuery.data.slice(MYCLASSES_SHARE_BACK_LIST_PREFIX.length));
+    const { text, keyboard } = await renderMyClassesPage(String(ctx.user._id), page, lang);
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
+  });
+
   bot.callbackQuery(MYCLASSES_NOOP_CB, async (ctx) => {
     await ctx.answerCallbackQuery();
   });
@@ -512,6 +554,7 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
       ctx.session.classEditorMode = undefined;
       ctx.session.activeClassId = String(created._id);
       const result = await renderClassView(String(created._id), ctx.user._id, 1, ctx.lang());
+      await ctx.reply(t(ctx.lang(), "myclasses.created", { title }));
       if (result) {
         await ctx.reply(result.text, { reply_markup: result.keyboard });
       }

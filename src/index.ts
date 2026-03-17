@@ -164,7 +164,7 @@ const bootstrap = async (): Promise<void> => {
   await recoverExpiredGroupTimers(groupSessionRepo, testRepo, bot.api);
 
   await bot.start({
-    allowed_updates: ["message", "callback_query"],
+    allowed_updates: ["message", "callback_query", "poll_answer"],
     onStart: () => {
       console.info(`[bot] Quiz Bot started in ${config.NODE_ENV} mode`);
     }

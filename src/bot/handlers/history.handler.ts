@@ -6,6 +6,7 @@ import type { Question } from "../../shared/types/index.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import { formatDate } from "../utils/format.js";
 import { safeEditMessage } from "../utils/telegram.js";
+import { NAV_JOIN_CALLBACK, NAV_NEWTEST_CALLBACK } from "./commands.js";
 
 const HISTORY_PAGE_SIZE = 10;
 const HISTORY_PAGE_CALLBACK_PREFIX = "history:page:";
@@ -137,7 +138,11 @@ export const registerHistoryHandler = (bot: Bot<BotContext>): void => {
 
     const totalItems = await testSessionRepository.countByUser(ctx.user._id);
     if (totalItems === 0) {
-      await ctx.reply(t(lang, "history.noSessions"));
+      await ctx.reply(t(lang, "history.noSessions"), {
+        reply_markup: new InlineKeyboard()
+          .text(t(lang, "deadend.btn.create_test"), NAV_NEWTEST_CALLBACK)
+          .text(t(lang, "deadend.btn.join_test"), NAV_JOIN_CALLBACK)
+      });
       return;
     }
 

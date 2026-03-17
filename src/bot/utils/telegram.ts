@@ -38,3 +38,16 @@ export async function safeEditMessageViaApi(
     throw error;
   }
 }
+
+export async function safeDeleteMessage(
+  api: Api,
+  chatId: number | string,
+  messageId: number
+): Promise<void> {
+  try {
+    await api.deleteMessage(chatId, messageId);
+  } catch {
+    // Ignore
+  }
+}
+

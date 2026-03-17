@@ -4,7 +4,7 @@ import { TestRepository } from "../../db/repositories/test.repository.js";
 import { UserRepository } from "../../db/repositories/user.repository.js";
 import { logger } from "../../shared/logger.js";
 import { registerHistoryHandler } from "./history.handler.js";
-import { registerMyTestsHandler } from "./mytests.handler.js";
+import { registerMyTestsHandler, showMyTestsPage } from "./mytests.handler.js";
 import { registerClassesHandler, showClassPreviewFromShareCode, showMyClassesPage } from "./classes.handler.js";
 import { registerLeaderboardHandler, renderLeaderboard } from "./leaderboard.handler.js";
 import { registerSettingsHandler, buildSettingsPage } from "./settings.handler.js";
@@ -12,13 +12,14 @@ import { registerGroupHandlers, startGroupQuiz, cancelGroupQuiz, stopGroupQuiz }
 import type { BotContext } from "../types.js";
 import { resetSession } from "../types.js";
 import { enterUploadFlow } from "./upload.handler.js";
-import { enterTestFlow, registerTestPollHandler } from "./test.handler.js";
+import { enterTestFlow } from "./test.handler.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import { TestSessionRepository } from "../../db/repositories/test-session.repository.js";
 import type { UserStats } from "../../db/repositories/test-session.repository.js";
 import { GroupSessionRepository } from "../../db/repositories/group-session.repository.js";
 import { userCache } from "../middlewares/userMiddleware.js";
 import { safeEditMessage } from "../utils/telegram.js";
+import { buildMainMenuKeyboard } from "../utils/keyboards.js";
 
 const commands: BotCommand[] = [
   { command: "start", description: "Start the bot and open a shared test" },
@@ -49,6 +50,10 @@ const START_HELP_CALLBACK = "start:help";
 const START_STATS_CALLBACK = "start:stats";
 const START_SETTINGS_CALLBACK = "start:settings";
 const START_CLASSES_CALLBACK = "start:classes";
+export const NAV_MAIN_MENU_CALLBACK = "nav:main_menu";
+export const NAV_NEWTEST_CALLBACK = "nav:newtest";
+export const NAV_JOIN_CALLBACK = "nav:join";
+export const NAV_MYTESTS_CALLBACK = "nav:mytests";
 const testRepository = new TestRepository();
 const userRepository = new UserRepository();
 const testSessionRepository = new TestSessionRepository();
@@ -104,19 +109,6 @@ const previewSharedTest = async (ctx: BotContext, shareCode: string): Promise<vo
   await showTestPreview(ctx, String(test._id));
 };
 
-const buildWelcomeKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard()
-    .text(t(lang, "start.btn.newtest"), START_NEWTEST_CALLBACK)
-    .text(t(lang, "start.btn.join"), START_JOIN_CALLBACK)
-    .row()
-    .text(t(lang, "start.btn.stats"), START_STATS_CALLBACK)
-    .text(t(lang, "start.btn.settings"), START_SETTINGS_CALLBACK)
-    .row()
-    .text(t(lang, "start.btn.classes"), START_CLASSES_CALLBACK)
-    .text(t(lang, "start.btn.language"), START_LANGUAGE_CALLBACK)
-    .row()
-    .text(t(lang, "start.btn.help"), START_HELP_CALLBACK);
-
 const buildStatsMessage = (stats: UserStats, testsCreated: number, lang: Language): string => {
   if (stats.totalTests === 0) {
     return t(lang, "stats.empty");
@@ -141,6 +133,20 @@ const buildLanguageKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard()
     .text(t(lang, "language.btn.en"), `${LANG_CALLBACK_PREFIX}en`)
     .text(t(lang, "language.btn.uz"), `${LANG_CALLBACK_PREFIX}uz`);
+
+const buildStatsEmptyKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "deadend.btn.create_test"), NAV_NEWTEST_CALLBACK)
+    .text(t(lang, "deadend.btn.join_test"), NAV_JOIN_CALLBACK)
+    .row()
+    .text(t(lang, "deadend.btn.my_tests"), NAV_MYTESTS_CALLBACK);
+
+const buildJoinCancelledKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "deadend.btn.join_another"), NAV_JOIN_CALLBACK)
+    .text(t(lang, "deadend.btn.create_test"), NAV_NEWTEST_CALLBACK)
+    .row()
+    .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
 
 const handleJoinByCode = async (ctx: BotContext, raw: string): Promise<void> => {
   const shareCode = normalizeShareCode(raw);
@@ -197,10 +203,27 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     const lang = ctx.lang();
 
-    const text = ctx.isNewUser
-      ? t(lang, "start.welcome_new", { name: ctx.from?.first_name ?? "" })
-      : t(lang, "start.welcome_returning");
-    await ctx.reply(text, { reply_markup: buildWelcomeKeyboard(lang) });
+    const totalTestsTaken = ctx.user?.totalTestsTaken ?? 0;
+    const isNewUser = totalTestsTaken === 0 && (ctx.user ? await testRepository.countByCreator(ctx.user._id) === 0 : true);
+
+    let text: string;
+    if (isNewUser) {
+      text = t(lang, "start.welcome_new", { name: ctx.from?.first_name ?? "" });
+    } else {
+      const [stats, createdCount] = await Promise.all([
+        ctx.user ? testSessionRepository.getUserStats(ctx.user._id) : 
+          { totalTests: 0, averageScore: 0, bestScore: 0, totalQuestions: 0, totalCorrect: 0, testsThisWeek: 0 },
+        ctx.user ? testRepository.countByCreator(ctx.user._id) : 0
+      ]);
+      text = t(lang, "start.welcome_returning", {
+        name: ctx.from?.first_name ?? "",
+        totalTests: stats.totalTests,
+        avgScore: stats.averageScore,
+        bestScore: stats.bestScore,
+        createdCount
+      });
+    }
+    await ctx.reply(text, { reply_markup: buildMainMenuKeyboard(lang) });
   });
 
   bot.command("newtest", async (ctx) => {
@@ -436,10 +459,27 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
         return;
       }
 
-      const text = ctx.isNewUser
-        ? t(newLang, "start.welcome_new", { name: ctx.from?.first_name ?? "" })
-        : t(newLang, "start.welcome_returning");
-      await ctx.reply(text, { reply_markup: buildWelcomeKeyboard(newLang) });
+      const totalTestsTaken = ctx.user?.totalTestsTaken ?? 0;
+      const isNewUser = totalTestsTaken === 0 && (ctx.user ? await testRepository.countByCreator(ctx.user._id) === 0 : true);
+
+      let text: string;
+      if (isNewUser) {
+        text = t(newLang, "start.welcome_new", { name: ctx.from?.first_name ?? "" });
+      } else {
+        const [stats, createdCount] = await Promise.all([
+          ctx.user ? testSessionRepository.getUserStats(ctx.user._id) : 
+            { totalTests: 0, averageScore: 0, bestScore: 0, totalQuestions: 0, totalCorrect: 0, testsThisWeek: 0 },
+          ctx.user ? testRepository.countByCreator(ctx.user._id) : 0
+        ]);
+        text = t(newLang, "start.welcome_returning", {
+          name: ctx.from?.first_name ?? "",
+          totalTests: stats.totalTests,
+          avgScore: stats.averageScore,
+          bestScore: stats.bestScore,
+          createdCount
+        });
+      }
+      await ctx.reply(text, { reply_markup: buildMainMenuKeyboard(newLang) });
     }
 
     if (ctx.session.settingsReturnToMenu && ctx.user) {
@@ -475,7 +515,9 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   bot.callbackQuery(JOIN_CANCEL_CALLBACK, async (ctx) => {
     await ctx.answerCallbackQuery();
     ctx.session.pendingJoinCode = undefined;
-    await ctx.reply(t(ctx.lang(), "commands.joinCancelled"));
+    await ctx.reply(t(ctx.lang(), "commands.joinCancelled"), {
+      reply_markup: buildJoinCancelledKeyboard(ctx.lang())
+    });
   });
 
   bot.callbackQuery(NEWTEST_CONFIRM_CALLBACK, async (ctx) => {
@@ -533,7 +575,9 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       testSessionRepository.getUserStats(ctx.user._id),
       testRepository.countByCreator(ctx.user._id)
     ]);
-    await ctx.reply(buildStatsMessage(stats, testsCreated, lang));
+    const text = buildStatsMessage(stats, testsCreated, lang);
+    const reply_markup = stats.totalTests === 0 ? buildStatsEmptyKeyboard(lang) : undefined;
+    await ctx.reply(text, { reply_markup });
   });
 
   bot.command("settings", async (ctx) => {
@@ -546,32 +590,18 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.reply(text, { reply_markup: keyboard });
   });
 
-  // Welcome screen button callbacks
-  bot.callbackQuery(START_NEWTEST_CALLBACK, async (ctx) => {
-    await ctx.answerCallbackQuery();
+  // Main menu text handlers (Reply Keyboard)
+  bot.hears([t("en", "menu.create_test"), t("uz", "menu.create_test")], async (ctx) => {
     await enterUploadFlow(ctx);
   });
 
-  bot.callbackQuery(START_JOIN_CALLBACK, async (ctx) => {
-    await ctx.answerCallbackQuery();
+  bot.hears([t("en", "menu.join_test"), t("uz", "menu.join_test")], async (ctx) => {
     ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
     await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
   });
 
-  bot.callbackQuery(START_LANGUAGE_CALLBACK, async (ctx) => {
+  bot.hears([t("en", "menu.my_stats"), t("uz", "menu.my_stats")], async (ctx) => {
     const lang = ctx.lang();
-    await ctx.answerCallbackQuery();
-    await ctx.reply(t(lang, "language.prompt"), { reply_markup: buildLanguageKeyboard(lang) });
-  });
-
-  bot.callbackQuery(START_HELP_CALLBACK, async (ctx) => {
-    await ctx.answerCallbackQuery();
-    await ctx.reply(t(ctx.lang(), "commands.help"));
-  });
-
-  bot.callbackQuery(START_STATS_CALLBACK, async (ctx) => {
-    const lang = ctx.lang();
-    await ctx.answerCallbackQuery();
     if (!ctx.user) {
       await ctx.reply(t(lang, "error.userLoad"));
       return;
@@ -580,12 +610,13 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       testSessionRepository.getUserStats(ctx.user._id),
       testRepository.countByCreator(ctx.user._id)
     ]);
-    await ctx.reply(buildStatsMessage(stats, testsCreated, lang));
+    const text = buildStatsMessage(stats, testsCreated, lang);
+    const reply_markup = stats.totalTests === 0 ? buildStatsEmptyKeyboard(lang) : undefined;
+    await ctx.reply(text, { reply_markup });
   });
 
-  bot.callbackQuery(START_SETTINGS_CALLBACK, async (ctx) => {
+  bot.hears([t("en", "menu.settings"), t("uz", "menu.settings")], async (ctx) => {
     const lang = ctx.lang();
-    await ctx.answerCallbackQuery();
     if (!ctx.user) {
       await ctx.reply(t(lang, "error.userLoad"));
       return;
@@ -594,9 +625,37 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.reply(text, { reply_markup: keyboard });
   });
 
-  bot.callbackQuery(START_CLASSES_CALLBACK, async (ctx) => {
-    await ctx.answerCallbackQuery();
+  bot.hears([t("en", "menu.language"), t("uz", "menu.language")], async (ctx) => {
+    const lang = ctx.lang();
+    await ctx.reply(t(lang, "language.prompt"), { reply_markup: buildLanguageKeyboard(lang) });
+  });
+
+  bot.hears([t("en", "menu.help"), t("uz", "menu.help")], async (ctx) => {
+    await ctx.reply(t(ctx.lang(), "commands.help"));
+  });
+
+  bot.hears([t("en", "menu.my_classes"), t("uz", "menu.my_classes")], async (ctx) => {
     await showMyClassesPage(ctx, 1);
+  });
+
+  bot.hears([t("en", "menu.my_tests"), t("uz", "menu.my_tests")], async (ctx) => {
+    await showMyTestsPage(ctx, 1);
+  });
+
+  bot.callbackQuery(NAV_NEWTEST_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await enterUploadFlow(ctx);
+  });
+
+  bot.callbackQuery(NAV_JOIN_CALLBACK, async (ctx) => {
+    ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
+    await ctx.answerCallbackQuery();
+    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+  });
+
+  bot.callbackQuery(NAV_MYTESTS_CALLBACK, async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await showMyTestsPage(ctx, 1);
   });
 
   registerMyTestsHandler(bot);
@@ -604,6 +663,5 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   registerHistoryHandler(bot);
   registerLeaderboardHandler(bot);
   registerGroupHandlers(bot);
-  registerTestPollHandler(bot);
   registerSettingsHandler(bot);
 };

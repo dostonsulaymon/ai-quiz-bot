@@ -11,6 +11,10 @@ import { stateRouter } from "./router.js";
 import { logger } from "../shared/logger.js";
 import { t } from "../shared/i18n/index.js";
 import { recordUpdate } from "../shared/metrics.js";
+import { handlePollAnswer } from "./handlers/test.handler.js";
+import { handleGroupPollAnswer } from "./handlers/group.handler.js";
+import { activePollSessions } from "./types.js";
+import { registerUploadDeadEndHandlers } from "./handlers/upload.handler.js";
 
 export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
@@ -85,7 +89,23 @@ export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
   });
 
   await registerCommandHandlers(bot);
+  registerUploadDeadEndHandlers(bot);
   registerErrorMiddleware(bot);
+
+  // Native Poll Answers
+  bot.on("poll_answer", async (ctx) => {
+    const pollId = ctx.pollAnswer?.poll_id;
+    if (!pollId) return;
+
+    const sessionMeta = activePollSessions.get(pollId);
+    if (!sessionMeta) return;
+
+    if (sessionMeta.chatId.startsWith("-")) {
+      await handleGroupPollAnswer(ctx, sessionMeta);
+    } else {
+      await handlePollAnswer(ctx, sessionMeta);
+    }
+  });
 
   logger.info("Bot middleware initialized");
 

@@ -6,6 +6,7 @@ import { logger } from "../../shared/logger.js";
 import { recordError } from "../../shared/metrics.js";
 import type { BotContext } from "../types.js";
 import { t } from "../../shared/i18n/index.js";
+import { NAV_MAIN_MENU_CALLBACK } from "../handlers/commands.js";
 
 const RETRY_CALLBACK = "error:retry";
 
@@ -48,8 +49,10 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
 
     try {
       const keyboard = appError.isRetryable
-        ? new InlineKeyboard().text(t(lang, "error.btn.tryAgain"), RETRY_CALLBACK)
-        : undefined;
+        ? new InlineKeyboard()
+            .text(t(lang, "error.btn.tryAgain"), RETRY_CALLBACK)
+            .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK)
+        : new InlineKeyboard().text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
 
       const message =
         appError.code === "UNEXPECTED_ERROR" || appError.userMessage === "GENERIC"

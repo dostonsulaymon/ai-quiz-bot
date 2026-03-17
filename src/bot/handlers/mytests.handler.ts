@@ -10,10 +10,12 @@ import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.j
 import { formatDate } from "../utils/format.js";
 import { safeEditMessage } from "../utils/telegram.js";
 import { generateTestPDF } from "../utils/pdf-export.js";
+import { NAV_NEWTEST_CALLBACK } from "./commands.js";
 
 const MYTESTS_PAGE_SIZE = 5;
 const MYTESTS_PAGE_CALLBACK_PREFIX = "mytests:page:";
 const MYTESTS_SHARE_CALLBACK_PREFIX = "mytests:share:";
+const MYTESTS_MANAGE_CALLBACK_PREFIX = "mytests:manage:";
 const MYTESTS_DELETE_CALLBACK_PREFIX = "mytests:delete:";
 const MYTESTS_DELETE_CONFIRM_CALLBACK_PREFIX = "mytests:delete:confirm:";
 const MYTESTS_DELETE_CANCEL_CALLBACK_PREFIX = "mytests:delete:cancel:";
@@ -61,52 +63,73 @@ const renderMyTestsPage = async (userId: string, page: number, lang: Language): 
         ? t(lang, "mytests.not_taken")
         : participantCount === 1
         ? t(lang, "mytests.one_taken")
-        : undefined;
+        : t(lang, "mytests.many_taken", { n: participantCount });
 
     const row = [
       t(lang, "mytests.testRow", {
         n: index + 1,
         title: test.title?.trim() || t(lang, "common.untitled"),
-        q: test.questions.length,
-        types: formatQuestionTypes(test.questions.map((question) => question.type), lang)
+        q: test.questions.length
       }),
-      t(lang, "mytests.testRowMeta", { n: takeCountMap.get(String(test._id)) ?? 0, date: formatDate(test.createdAt, false, lang) })
+      t(lang, "mytests.testRowTypes", { 
+        types: formatQuestionTypes(test.questions.map((question) => question.type), lang),
+        date: formatDate(test.createdAt, false, lang) 
+      }),
+      t(lang, "mytests.testRowMeta", { participants: participantHint })
     ];
 
-    if (participantHint) row.push(participantHint);
     row.push("");
     return row;
   });
 
   const keyboard = new InlineKeyboard();
-  tests.forEach((test, index) => {
+  tests.forEach((test) => {
     const testId = String(test._id);
-    const participantCount = participantCountMap.get(testId) ?? 0;
     keyboard
-      .text(t(lang, "mytests.btn.take", { n: index + 1 }), `${MYTESTS_TAKE_CALLBACK_PREFIX}${testId}`)
+      .text(t(lang, "mytests.btn.start_test"), `${MYTESTS_TAKE_CALLBACK_PREFIX}${testId}`)
       .text(t(lang, "mytests.btn.share"), `${MYTESTS_SHARE_CALLBACK_PREFIX}${testId}:${currentPage}`)
-      .text(t(lang, "mytests.btn.delete"), `${MYTESTS_DELETE_CALLBACK_PREFIX}${testId}:${currentPage}`)
-      .row()
-      .text(t(lang, "mytests.btn.preview"), `${MYTESTS_PREVIEW_CALLBACK_PREFIX}${testId}:${currentPage}`)
-      .text(t(lang, "mytests.btn.edit"), `${MYTESTS_EDIT_CALLBACK_PREFIX}${testId}`)
-      .text(t(lang, "mytests.btn.duplicate"), `${MYTESTS_DUPLICATE_CALLBACK_PREFIX}${testId}:${currentPage}`);
-
-    keyboard
-      .row()
-      .text(t(lang, "mytests.btn.export_clean"), `${MYTESTS_EXPORT_CALLBACK_PREFIX}${testId}:clean`)
-      .text(t(lang, "mytests.btn.export_answers"), `${MYTESTS_EXPORT_CALLBACK_PREFIX}${testId}:answers`);
-
-    if (participantCount >= 2) {
-      keyboard.row().text(t(lang, "leaderboard.btn"), `${LEADERBOARD_CALLBACK_PREFIX}${testId}`);
-    }
-
-    keyboard.row();
+      .text(t(lang, "mytests.btn.manage"), `${MYTESTS_MANAGE_CALLBACK_PREFIX}${testId}:${currentPage}`)
+      .row();
   });
 
   keyboard.append(buildPaginationRow(currentPage, totalPages, lang));
 
   return {
     text: [t(lang, "mytests.header"), "", ...lines].join("\n").trim(),
+    keyboard
+  };
+};
+
+const renderMoreActions = async (userId: string, testId: string, page: number, lang: Language): Promise<{ text: string; keyboard: InlineKeyboard }> => {
+  const owned = await testRepository.findByIdAndCreator(testId, userId);
+  if (!owned) {
+    return {
+      text: t(lang, "mytests.testUnavailable"),
+      keyboard: new InlineKeyboard().text(t(lang, "btn.back"), `${MYTESTS_BACK_CALLBACK_PREFIX}${page}`)
+    };
+  }
+
+  const participantCount = await leaderboardRepository.getParticipantCount(testId).catch(() => 0);
+
+  const keyboard = new InlineKeyboard()
+    .text(t(lang, "mytests.btn.edit"), `${MYTESTS_EDIT_CALLBACK_PREFIX}${testId}`)
+    .text(t(lang, "mytests.btn.duplicate"), `${MYTESTS_DUPLICATE_CALLBACK_PREFIX}${testId}:${page}`)
+    .row()
+    .text(t(lang, "mytests.btn.export_clean"), `${MYTESTS_EXPORT_CALLBACK_PREFIX}${testId}:clean`)
+    .text(t(lang, "mytests.btn.export_answers"), `${MYTESTS_EXPORT_CALLBACK_PREFIX}${testId}:answers`)
+    .row();
+
+  if (participantCount >= 2) {
+    keyboard.text(t(lang, "leaderboard.btn"), `${LEADERBOARD_CALLBACK_PREFIX}${testId}`).row();
+  }
+
+  keyboard
+    .text(t(lang, "mytests.btn.delete"), `${MYTESTS_DELETE_CALLBACK_PREFIX}${testId}:${page}`)
+    .row()
+    .text(t(lang, "mytests.btn.back_list"), `${MYTESTS_BACK_CALLBACK_PREFIX}${page}`);
+
+  return {
+    text: t(lang, "mytests.manage.title", { title: owned.title?.trim() || t(lang, "common.untitledTest") }),
     keyboard
   };
 };
@@ -127,7 +150,7 @@ const renderPreview = async (testId: string, page: number, lang: Language): Prom
       t(lang, "mytests.preview.types", { types: formatQuestionTypes(test.questions.map((question) => question.type), lang) })
     ].join("\n"),
     keyboard: new InlineKeyboard()
-      .text(t(lang, "mytests.btn.takeTest"), `${MYTESTS_TAKE_CALLBACK_PREFIX}${testId}`)
+      .text(t(lang, "mytests.btn.start_test"), `${MYTESTS_TAKE_CALLBACK_PREFIX}${testId}`)
       .text(t(lang, "btn.back"), `${MYTESTS_BACK_CALLBACK_PREFIX}${page}`)
   };
 };
@@ -163,26 +186,33 @@ const startOwnedTest = async (ctx: BotContext, testId: string): Promise<void> =>
   await enterTestFlow(ctx, testId);
 };
 
+export const showMyTestsPage = async (ctx: BotContext, page: number = 1): Promise<void> => {
+  if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
+    await ctx.reply(t(ctx.lang(), "cmd.private_only"));
+    return;
+  }
+  const lang = ctx.lang();
+  if (!ctx.user) {
+    await ctx.reply(t(lang, "error.userLoad"));
+    return;
+  }
+
+  const userId = String(ctx.user._id);
+  const totalItems = await testRepository.countByCreator(ctx.user._id);
+  if (totalItems === 0) {
+    await ctx.reply(t(lang, "mytests.noTests"), {
+      reply_markup: new InlineKeyboard().text(t(lang, "deadend.btn.create_test"), NAV_NEWTEST_CALLBACK)
+    });
+    return;
+  }
+
+  const { text, keyboard } = await renderMyTestsPage(userId, page, lang);
+  await ctx.reply(text, { reply_markup: keyboard });
+};
+
 export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
   bot.command("mytests", async (ctx) => {
-    if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
-      await ctx.reply(t(ctx.lang(), "cmd.private_only"));
-      return;
-    }
-    const lang = ctx.lang();
-    if (!ctx.user) {
-      await ctx.reply(t(lang, "error.userLoad"));
-      return;
-    }
-
-    const totalItems = await testRepository.countByCreator(ctx.user._id);
-    if (totalItems === 0) {
-      await ctx.reply(t(lang, "mytests.noTests"));
-      return;
-    }
-
-    const { text, keyboard } = await renderMyTestsPage(String(ctx.user._id), 1, lang);
-    await ctx.reply(text, { reply_markup: keyboard });
+    await showMyTestsPage(ctx, 1);
   });
 
   bot.callbackQuery(new RegExp(`^${MYTESTS_PAGE_CALLBACK_PREFIX}`), async (ctx) => {
@@ -234,6 +264,20 @@ export const registerMyTestsHandler = (bot: Bot<BotContext>): void => {
     }
 
     const { text, keyboard } = await renderShareView(testId ?? "", Number(pageValue ?? "1"), lang, ctx.me.username);
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
+  });
+
+  bot.callbackQuery(new RegExp(`^${MYTESTS_MANAGE_CALLBACK_PREFIX}`), async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+
+    const payload = ctx.callbackQuery.data.slice(MYTESTS_MANAGE_CALLBACK_PREFIX.length);
+    const [testId, pageValue] = payload.split(":");
+    const { text, keyboard } = await renderMoreActions(String(ctx.user._id), testId ?? "", Number(pageValue ?? "1"), lang);
     await ctx.answerCallbackQuery();
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });

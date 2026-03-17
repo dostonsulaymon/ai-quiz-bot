@@ -6,6 +6,15 @@ import { logger } from "../../shared/logger.js";
 import type { GenerateQuestionsInput, Question } from "../../shared/types/index.js";
 import { createQuestionPrompt, parseQuestionsResponse } from "./base.provider.js";
 
+function repairTruncatedJSON(raw: string): string {
+  // Find the last complete question object by finding the last }]
+  // or last complete }, { pattern
+  const lastCompleteIndex = raw.lastIndexOf("},");
+  if (lastCompleteIndex === -1) return raw;
+  // Close the array with the last complete object
+  return raw.slice(0, lastCompleteIndex + 1) + "]";
+}
+
 type GeminiResponse = {
   candidates?: Array<{
     content?: {
@@ -55,12 +64,13 @@ export class GeminiProvider implements IAIProvider {
           systemInstruction: {
             parts: [
               {
-                text: createQuestionPrompt(input)
+                text: `${createQuestionPrompt(input)}\nImportant: Ensure each question is complete before starting the next. It is better to return fewer complete questions than many incomplete ones.`
               }
             ]
           },
           generationConfig: {
-            temperature: 0.2
+            temperature: 0.7,
+            maxOutputTokens: 8192
           }
         })
       });
@@ -102,14 +112,38 @@ export class GeminiProvider implements IAIProvider {
     });
 
     try {
-      return parseQuestionsResponse(text);
+      const questions = parseQuestionsResponse(text);
+      if (questions.length < input.questionCount) {
+        logger.warn("Gemini returned fewer questions than requested — using partial result", {
+          requested: input.questionCount,
+          received: questions.length
+        });
+      }
+      return questions;
     } catch (error) {
-      logger.error("Gemini parse failed", {
-        event: "ai.provider.parse.failed",
-        provider: "gemini",
-        raw: text.slice(0, 200)
+      logger.warn("Attempting to repair truncated JSON response", {
+        event: "ai.provider.parse.repair_attempt",
+        provider: "gemini"
       });
-      throw error;
+      
+      const repairedText = repairTruncatedJSON(text);
+      try {
+        const repairedQuestions = parseQuestionsResponse(repairedText);
+        if (repairedQuestions.length < input.questionCount) {
+          logger.warn("Gemini returned fewer questions than requested after repair — using partial result", {
+            requested: input.questionCount,
+            received: repairedQuestions.length
+          });
+        }
+        return repairedQuestions;
+      } catch (repairError) {
+        logger.error("Gemini parse failed even after repair", {
+          event: "ai.provider.parse.failed",
+          provider: "gemini",
+          raw: text.slice(0, 200)
+        });
+        throw repairError;
+      }
     }
   }
 

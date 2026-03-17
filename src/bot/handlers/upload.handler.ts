@@ -16,6 +16,7 @@ import { TestRepository } from "../../db/repositories/test.repository.js";
 import { enterTestFlow } from "./test.handler.js";
 import { enterReviewFlow } from "./review.handler.js";
 import { storeUploadData, getUploadData, deleteAllUploadData } from "../utils/upload-storage.js";
+import { NAV_MAIN_MENU_CALLBACK, NAV_MYTESTS_CALLBACK } from "./commands.js";
 
 const testRepository = new TestRepository();
 
@@ -30,6 +31,7 @@ const QUESTION_TYPES_CONFIRM_CALLBACK = "upload:types:confirm";
 const SHUFFLE_CALLBACK_PREFIX = "upload:shuffle:";
 const TIMER_CALLBACK_PREFIX = "upload:timer:";
 const ACTION_CALLBACK_PREFIX = "upload:action:";
+const SAVE_START_CALLBACK_PREFIX = "upload:save:start:";
 const MAX_IMAGES = 10;
 const MAX_CUSTOM_QUESTION_COUNT = 50;
 const DEFAULT_MAX_FILE_SIZE_MB = 20;
@@ -111,7 +113,7 @@ const buildQuestionTypesKeyboard = (
     .text(toggleLabel("short"), `${QUESTION_TYPES_CALLBACK_PREFIX}short`)
     .text(toggleLabel("fill"), `${QUESTION_TYPES_CALLBACK_PREFIX}fill`)
     .row()
-    .text(t(lang, "upload.btn.confirmTypes"), QUESTION_TYPES_CONFIRM_CALLBACK);
+    .text(t(lang, "upload.btn.done"), QUESTION_TYPES_CONFIRM_CALLBACK);
 };
 
 const buildDoneAddingImagesKeyboard = (lang: Language): InlineKeyboard =>
@@ -174,6 +176,14 @@ const buildActionKeyboard = (lang: Language): InlineKeyboard =>
     .text(t(lang, "upload.action.review"), `${ACTION_CALLBACK_PREFIX}review`)
     .row()
     .text(t(lang, "upload.action.save"), `${ACTION_CALLBACK_PREFIX}save`);
+
+const buildSavedTestKeyboard = (testId: string, link: string, lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "deadend.btn.start_test"), `${SAVE_START_CALLBACK_PREFIX}${testId}`)
+    .url(t(lang, "deadend.btn.share_link"), link)
+    .row()
+    .text(t(lang, "deadend.btn.my_tests"), NAV_MYTESTS_CALLBACK)
+    .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
 
 type ImageFileInfo = { fileId: string; fileSize: number | undefined; mimeType: string };
 
@@ -1061,7 +1071,9 @@ const handleWaitingAction = async (ctx: BotContext): Promise<void> => {
     const instructions = t(lang, "share.instructions", { code, link });
     logger.info("Test saved and shared from action menu", { event: "upload.action.save", userId: ctx.from?.id, testId });
     resetSession(ctx.session);
-    await ctx.reply(t(lang, "upload.action.saveShareCard", { instructions }));
+    await ctx.reply(t(lang, "upload.action.saveShareCard", { instructions }), {
+      reply_markup: buildSavedTestKeyboard(testId, link, lang)
+    });
   }
 };
 
@@ -1148,4 +1160,12 @@ export const uploadRouterFull = async (ctx: BotContext): Promise<void> => {
   if (step === "waiting_types") {
     await handleWaitingTypes(ctx);
   }
+};
+
+export const registerUploadDeadEndHandlers = (bot: import("grammy").Bot<BotContext>): void => {
+  bot.callbackQuery(new RegExp(`^${SAVE_START_CALLBACK_PREFIX}`), async (ctx) => {
+    const testId = ctx.callbackQuery.data.slice(SAVE_START_CALLBACK_PREFIX.length);
+    await ctx.answerCallbackQuery();
+    await enterTestFlow(ctx, testId);
+  });
 };

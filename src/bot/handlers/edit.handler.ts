@@ -275,6 +275,7 @@ const handleTitle = async (ctx: BotContext): Promise<void> => {
 
   ctx.session.editingTitle = text;
   logger.info("Edit title updated", { event: "edit.title.updated", userId: ctx.from?.id });
+  await ctx.reply(t(lang, "edit.title_updated"));
   await showEditMenu(ctx);
 };
 
@@ -514,6 +515,7 @@ const handleEditingAnswer = async (ctx: BotContext): Promise<void> => {
   ctx.session.editingDraft = questions;
   ctx.session.editingQuestionSubState = "idle";
   logger.info("Edit answer updated", { event: "edit.answer.updated", userId: ctx.from?.id, questionIndex: index });
+  await ctx.reply(t(lang, "edit.answer_updated"));
 
   const messageId = ctx.session.editingMessageId;
   if (messageId) {

@@ -172,7 +172,10 @@ export type ActivePollSession = {
   mode: "private" | "group";
   sessionId: string;
   chatId: string;
+  userId: number;
   questionIndex: number;
+  isGroup?: boolean;
+  groupSessionId?: string;
 };
 
 export const activePollSessions = new Map<string, ActivePollSession>();
