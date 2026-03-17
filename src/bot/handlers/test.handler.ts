@@ -77,28 +77,32 @@ const scheduleAutoAdvance = (params: AutoAdvanceParams): void => {
   const key = String(params.chatId);
   const intervals: ReturnType<typeof setTimeout>[] = [];
 
-  // Schedule a countdown edit every 5 seconds until the question expires.
-  // intervalCount = number of complete 5-second blocks; we fire at 5, 10, ..., (n-1)*5 s.
-  const intervalCount = Math.floor(params.timeLimitSeconds / 5);
-  for (let i = 1; i < intervalCount; i++) {
-    const remaining = params.timeLimitSeconds - i * 5;
-    const intervalTimer = setTimeout(() => {
-      void (async () => {
-        const storage = new RedisSessionStorage<BotSession>(params.redis, config.SESSION_TTL_SECONDS);
-        const session = await storage.read(params.sessionKey);
-        if (!session || session.currentQuestionIndex !== params.questionIndex || session.questionStartedAt === undefined) {
-          return;
-        }
-        const updatedText = formatQuestionText(params.question, params.questionIndex, params.totalQuestions, params.lang, params.timeLimitSeconds, remaining);
-        try {
-          // Omitting reply_markup preserves the existing keyboard on Telegram's end
-          await safeEditMessageViaApi(params.api, params.chatId, params.messageId, updatedText);
-        } catch {
-          // Ignore — message may have been answered or deleted
-        }
-      })();
-    }, i * 5 * 1000);
-    intervals.push(intervalTimer);
+  const isNativePoll = params.question.type === "mcq" || params.question.type === "truefalse";
+
+  if (!isNativePoll) {
+    // Schedule a countdown edit every 5 seconds until the question expires.
+    // intervalCount = number of complete 5-second blocks; we fire at 5, 10, ..., (n-1)*5 s.
+    const intervalCount = Math.floor(params.timeLimitSeconds / 5);
+    for (let i = 1; i < intervalCount; i++) {
+      const remaining = params.timeLimitSeconds - i * 5;
+      const intervalTimer = setTimeout(() => {
+        void (async () => {
+          const storage = new RedisSessionStorage<BotSession>(params.redis, config.SESSION_TTL_SECONDS);
+          const session = await storage.read(params.sessionKey);
+          if (!session || session.currentQuestionIndex !== params.questionIndex || session.questionStartedAt === undefined) {
+            return;
+          }
+          const updatedText = formatQuestionText(params.question, params.questionIndex, params.totalQuestions, params.lang, params.timeLimitSeconds, remaining);
+          try {
+            // Omitting reply_markup preserves the existing keyboard on Telegram's end
+            await safeEditMessageViaApi(params.api, params.chatId, params.messageId, updatedText);
+          } catch {
+            // Ignore — message may have been answered or deleted
+          }
+        })();
+      }, i * 5 * 1000);
+      intervals.push(intervalTimer);
+    }
   }
 
   const main = setTimeout(() => {
@@ -119,12 +123,16 @@ const runAutoAdvance = async (params: AutoAdvanceParams): Promise<void> => {
     return;
   }
 
-  // Edit the question message to show timeout and strip the answer keyboard
-  const timedOutText = `${formatQuestionText(question, questionIndex, totalQuestions, lang)}\n\n${t(lang, "test.timeout_auto")}`;
-  try {
-    await safeEditMessageViaApi(api, chatId, messageId, timedOutText, { reply_markup: new InlineKeyboard() });
-  } catch {
-    // Ignore — message may have already been edited by a concurrent answer
+  const isNativePoll = question.type === "mcq" || question.type === "truefalse";
+
+  if (!isNativePoll) {
+    // Edit the question message to show timeout and strip the answer keyboard
+    const timedOutText = `${formatQuestionText(question, questionIndex, totalQuestions, lang)}\n\n${t(lang, "test.timeout_auto")}`;
+    try {
+      await safeEditMessageViaApi(api, chatId, messageId, timedOutText, { reply_markup: new InlineKeyboard() });
+    } catch {
+      // Ignore — message may have already been edited by a concurrent answer
+    }
   }
 
   // Record wrong answer
@@ -511,21 +519,21 @@ const sendCurrentQuestion = async (ctx: BotContext): Promise<void> => {
     ctx.session.testQuestionMessageId = message.message_id;
     ctx.session.questionStartedAt = Date.now();
     ctx.session.testSubState = "answering";
+  }
 
-    if (timeLimitSeconds > 0 && ctx.chat && ctx.from) {
-      scheduleAutoAdvance({
-        api: ctx.api,
-        redis: ctx.redis,
-        chatId: ctx.chat.id,
-        sessionKey: `${ctx.from.id}:${ctx.chat.id}`,
-        messageId: message.message_id,
-        question,
-        questionIndex: index,
-        totalQuestions: questions.length,
-        lang,
-        timeLimitSeconds
-      });
-    }
+  if (timeLimitSeconds > 0 && ctx.chat && ctx.from && ctx.session.testQuestionMessageId) {
+    scheduleAutoAdvance({
+      api: ctx.api,
+      redis: ctx.redis,
+      chatId: ctx.chat.id,
+      sessionKey: `${ctx.from.id}:${ctx.chat.id}`,
+      messageId: ctx.session.testQuestionMessageId,
+      question,
+      questionIndex: index,
+      totalQuestions: questions.length,
+      lang,
+      timeLimitSeconds
+    });
   }
 };
 
@@ -1075,10 +1083,11 @@ export const processPrivateChoiceAnswer = async (
   pollSession: import("../types.js").ActivePollSession
 ): Promise<void> => {
   const pollAnswer = ctx.pollAnswer;
-  if (!pollAnswer) return;
+  if (!pollAnswer || !pollAnswer.user) return;
+  const user = pollAnswer.user;
 
   const { sessionId, chatId, questionIndex } = pollSession;
-  const userId = pollAnswer.user.id;
+  const userId = user.id;
   const storage = new RedisSessionStorage<BotSession>(ctx.redis, config.SESSION_TTL_SECONDS);
   const sessionKey = `${userId}:${chatId}`;
   const session = await storage.read(sessionKey);
@@ -1122,10 +1131,11 @@ export const processPrivateChoiceAnswer = async (
   session.testPollId = undefined;
 
   activePollSessions.delete(pollAnswer.poll_id);
+  cancelQuestionTimeout(Number(chatId));
 
   // Set up a mock context for sendCurrentQuestion
-  Object.defineProperty(ctx, "chat", { get: () => ({ id: Number(chatId), type: "private", first_name: pollAnswer.user.first_name }) });
-  Object.defineProperty(ctx, "from", { get: () => pollAnswer.user });
+  Object.defineProperty(ctx, "chat", { get: () => ({ id: Number(chatId), type: "private", first_name: user?.first_name }) });
+  Object.defineProperty(ctx, "from", { get: () => user });
   Object.defineProperty(ctx, "session", { get: () => session, set: (v) => Object.assign(session, v) });
   
   await sendCurrentQuestion(ctx);
@@ -1135,7 +1145,8 @@ export const processPrivateChoiceAnswer = async (
 
 export const registerTestPollHandler = (bot: import("grammy").Bot<BotContext>): void => {
   bot.on("poll_answer", async (ctx: BotContext, next: () => Promise<void>) => {
-    const pollId = ctx.pollAnswer.poll_id;
+    const pollId = ctx.pollAnswer?.poll_id;
+    if (!pollId) return next();
     const sessionMeta = activePollSessions.get(pollId);
     if (sessionMeta?.mode === "private") {
       await processPrivateChoiceAnswer(ctx, sessionMeta);

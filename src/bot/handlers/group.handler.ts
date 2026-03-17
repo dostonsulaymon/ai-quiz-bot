@@ -804,7 +804,7 @@ export const processGroupChoiceAnswer = async (
   pollSession: import("../types.js").ActivePollSession
 ): Promise<void> => {
   const pollAnswer = ctx.pollAnswer;
-  if (!pollAnswer) return;
+  if (!pollAnswer || !pollAnswer.user) return;
 
   const { sessionId, chatId, questionIndex } = pollSession;
   const userId = String(pollAnswer.user.id);
@@ -846,7 +846,9 @@ export const registerGroupHandlers = (bot: Bot<BotContext>): void => {
   });
 
   bot.callbackQuery(new RegExp(`^${GROUP_AGAIN_PREFIX}`), async (ctx: BotContext) => {
-    const testId = ctx.callbackQuery.data.slice(GROUP_AGAIN_PREFIX.length);
+    const data = ctx.callbackQuery?.data;
+    if (!data) return;
+    const testId = data.slice(GROUP_AGAIN_PREFIX.length);
     await ctx.answerCallbackQuery();
     await startGroupQuiz(ctx, testId);
   });
@@ -860,7 +862,8 @@ export const registerGroupHandlers = (bot: Bot<BotContext>): void => {
   });
 
   bot.on("poll_answer", async (ctx: BotContext, next: () => Promise<void>) => {
-    const pollId = ctx.pollAnswer.poll_id;
+    const pollId = ctx.pollAnswer?.poll_id;
+    if (!pollId) return next();
     const sessionMeta = activePollSessions.get(pollId);
     if (sessionMeta?.mode === "group") {
       await processGroupChoiceAnswer(ctx, sessionMeta);
