@@ -18,6 +18,7 @@ type Config = {
   GEMINI_MODEL?: string;
   OLLAMA_BASE_URL?: string;
   OLLAMA_MODEL?: string;
+  BOT_USERNAME?: string;
   SENTRY_DSN?: string;
   HEALTH_CHECK_PORT: number;
   NODE_ENV: NodeEnv;
@@ -87,6 +88,7 @@ export const config: Config = {
   GEMINI_MODEL: getEnv("GEMINI_MODEL", false),
   OLLAMA_BASE_URL: getEnv("OLLAMA_BASE_URL", false),
   OLLAMA_MODEL: getEnv("OLLAMA_MODEL", false),
+  BOT_USERNAME: getEnv("BOT_USERNAME", false),
   SENTRY_DSN: getEnv("SENTRY_DSN", false),
   HEALTH_CHECK_PORT: Number(process.env.HEALTH_CHECK_PORT) || 4334,
   NODE_ENV: nodeEnv,

@@ -13,10 +13,12 @@ import { getUploadData, deleteAllUploadData } from "../utils/upload-storage.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import { safeEditMessageViaApi } from "../utils/telegram.js";
 import { formatQuestionDisplay, formatOptionDisplay } from "../utils/format.js";
+import { NAV_MAIN_MENU_CALLBACK, NAV_NEWTEST_CALLBACK } from "./commands.js";
 
 const REVIEW_PREV_CALLBACK = "review:prev";
 const REVIEW_NEXT_CALLBACK = "review:next";
 const REVIEW_EDIT_CALLBACK = "review:edit";
+const REVIEW_EDIT_CANCEL_CALLBACK = "review:edit:cancel";
 const REVIEW_REGENERATE_CALLBACK = "review:regenerate";
 const REVIEW_DELETE_CALLBACK = "review:delete";
 const REVIEW_START_CALLBACK = "review:start";
@@ -66,10 +68,23 @@ const buildReviewKeyboard = (index: number, total: number, lang: Language): Inli
     .text(t(lang, "review.btn.regenerate"), REVIEW_REGENERATE_CALLBACK)
     .text(t(lang, "review.btn.delete"), REVIEW_DELETE_CALLBACK)
     .row()
-    .text(t(lang, "review.btn.startTest", { n: total }), REVIEW_START_CALLBACK);
+    .text(t(lang, "review.btn.startTest", { n: total }), REVIEW_START_CALLBACK)
+    .row()
+    .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
 
 const buildEmptyKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard().text(t(lang, "review.btn.regenerateAll"), REVIEW_REGENERATE_ALL_CALLBACK);
+  new InlineKeyboard()
+    .text(t(lang, "review.btn.regenerateAll"), REVIEW_REGENERATE_ALL_CALLBACK)
+    .row()
+    .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
+
+const buildEditCancelKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "review.edit.cancel_btn"), REVIEW_EDIT_CANCEL_CALLBACK);
+
+const buildReviewRecoveryKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "deadend.btn.create_test"), NAV_NEWTEST_CALLBACK)
+    .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
 
 // ---------------------------------------------------------------------------
 // Enter review flow
@@ -188,7 +203,7 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
             ? t(lang, "review.editHintTrueFalse")
             : t(lang, "review.editHintOpen");
 
-      await ctx.reply(hint);
+      await ctx.reply(hint, { reply_markup: buildEditCancelKeyboard(lang) });
       break;
     }
     case REVIEW_REGENERATE_CALLBACK: {
@@ -213,7 +228,9 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
           await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(question, reviewIndex, draftQuestions.length, lang), {
             reply_markup: buildReviewKeyboard(reviewIndex, draftQuestions.length, lang)
           });
-          await ctx.reply(t(lang, "upload.expired"));
+          await ctx.reply(t(lang, "upload.expired"), {
+            reply_markup: buildReviewRecoveryKeyboard(lang)
+          });
           break;
         }
         const generated = await generateWithFallback(input);
@@ -272,7 +289,9 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
         const input = await buildInputFromSession(ctx, questionCount, questionTypes);
         if (!input) {
           await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, t(lang, "review.noQuestionsRemain"), { reply_markup: buildEmptyKeyboard(lang) });
-          await ctx.reply(t(lang, "upload.expired"));
+          await ctx.reply(t(lang, "upload.expired"), {
+            reply_markup: buildReviewRecoveryKeyboard(lang)
+          });
           break;
         }
 
@@ -319,6 +338,25 @@ const handleReviewMain = async (ctx: BotContext): Promise<void> => {
 
 const handleEditingAnswer = async (ctx: BotContext): Promise<void> => {
   const lang = ctx.lang();
+
+  if (ctx.callbackQuery?.data === REVIEW_EDIT_CANCEL_CALLBACK) {
+    ctx.session.reviewSubState = "idle";
+    ctx.session.reviewEditQuestionIndex = undefined;
+    await ctx.answerCallbackQuery();
+    await ctx.deleteMessage().catch(() => undefined);
+
+    const draftQuestions = ctx.session.draftQuestions ?? [];
+    const reviewIndex = ctx.session.reviewIndex ?? 0;
+    const messageId = ctx.session.reviewMessageId;
+    const question = draftQuestions[reviewIndex];
+    if (messageId && question) {
+      await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, formatQuestionCard(question, reviewIndex, draftQuestions.length, lang), {
+        reply_markup: buildReviewKeyboard(reviewIndex, draftQuestions.length, lang)
+      });
+    }
+    return;
+  }
+
   const rawAnswer = ctx.msg?.text?.trim();
 
   if (!rawAnswer) {
@@ -451,7 +489,9 @@ const saveTestAndTransition = async (ctx: BotContext): Promise<void> => {
   const lang = ctx.lang();
   if (!ctx.user) {
     resetSession(ctx.session);
-    await ctx.reply(t(lang, "error.session_corrupted"));
+    await ctx.reply(t(lang, "error.session_corrupted"), {
+      reply_markup: buildReviewRecoveryKeyboard(lang)
+    });
     return;
   }
 

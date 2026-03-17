@@ -623,6 +623,16 @@ const handleAnswering = async (ctx: BotContext): Promise<void> => {
   }
 };
 
+function checkAnswerFuzzy(userAnswer: string, correctAnswer: string): boolean {
+  const normalize = (s: string) =>
+    s
+      .toLowerCase()
+      .trim()
+      .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, "")
+      .replace(/\s{2,}/g, " ");
+  return normalize(userAnswer) === normalize(correctAnswer);
+}
+
 const handleChoiceAnswer = async (
   ctx: BotContext,
   question: Question,
@@ -650,7 +660,7 @@ const handleChoiceAnswer = async (
   const elapsed = Math.floor((Date.now() - (ctx.session.questionStartedAt ?? Date.now())) / 1000);
   const timedOut = timeLimitSeconds > 0 && elapsed > timeLimitSeconds;
 
-  const isCorrect = !timedOut && userAnswer === question.correctAnswer;
+  const isCorrect = !timedOut && checkAnswerFuzzy(userAnswer, question.correctAnswer);
 
   await testSessionRepository.updateAnswer(sessionId, {
     questionId: question.id,
@@ -660,6 +670,7 @@ const handleChoiceAnswer = async (
 
   logger.info("Test answer submitted", { event: "test.answer.submitted", userId: ctx.from?.id, questionIndex: index, type: question.type, isCorrect, timedOut });
 
+  const reportLink = `[${t(lang, "test.report_bad_question")}](https://t.me/${config.BOT_USERNAME ?? ctx.me.username}?start=report_${question.id})`;
   const feedback = timedOut
     ? t(lang, "test.timeout", { answer: question.correctAnswer })
     : isCorrect
@@ -670,7 +681,7 @@ const handleChoiceAnswer = async (
 
   const messageId = ctx.session.testQuestionMessageId;
   if (messageId) {
-    await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, `${formatQuestionText(question, index, total, lang)}\n\n${feedback}`);
+    await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, `${formatQuestionText(question, index, total, lang)}\n\n${feedback}\n\n⚠️ ${reportLink}`, { parse_mode: "Markdown" });
   }
 
   if (isCorrect) {
@@ -725,6 +736,30 @@ const handleTextAnswer = async (
       await safeEditMessageViaApi(ctx.api, ctx.chatId!, messageId, `${formatQuestionText(question, index, questions.length, lang)}\n\n${feedback}`);
     }
 
+    ctx.session.currentQuestionIndex = index + 1;
+    ctx.session.questionStartedAt = undefined;
+    ctx.session.testQuestionMessageId = undefined;
+    await sendCurrentQuestion(ctx);
+    return;
+  }
+
+  // Fuzzy check for text answers - if it matches exactly (ignoring case/punctuation), skip self-grading
+  if (checkAnswerFuzzy(userAnswer, question.correctAnswer)) {
+    await testSessionRepository.updateAnswer(sessionId, {
+      questionId: question.id,
+      userAnswer,
+      isCorrect: true
+    } as QuestionAnswer);
+
+    logger.info("Test answer submitted (fuzzy match)", { event: "test.answer.submitted", userId: ctx.from?.id, questionIndex: index, type: question.type, isCorrect: true });
+
+    const questions = await resolveQuestions(ctx);
+    const feedback = t(lang, "test.correct");
+    const reportLink = `[${t(lang, "test.report_bad_question")}](https://t.me/${config.BOT_USERNAME ?? ctx.me.username}?start=report_${question.id})`;
+    
+    await ctx.reply(`${formatQuestionText(question, index, questions.length, lang)}\n\n${feedback}\n\n⚠️ ${reportLink}`, { parse_mode: "Markdown" });
+
+    ctx.session.testCorrectCount = (ctx.session.testCorrectCount ?? 0) + 1;
     ctx.session.currentQuestionIndex = index + 1;
     ctx.session.questionStartedAt = undefined;
     ctx.session.testQuestionMessageId = undefined;
@@ -820,7 +855,9 @@ const completeTest = async (ctx: BotContext, totalQuestions: number): Promise<vo
 
   if (!ctx.user) {
     resetSession(ctx.session);
-    await ctx.reply(t(lang, "error.session_corrupted"));
+    await ctx.reply(t(lang, "error.session_corrupted"), {
+      reply_markup: buildMainMenuKeyboard(lang)
+    });
     return;
   }
 
@@ -842,7 +879,9 @@ const completeTest = async (ctx: BotContext, totalQuestions: number): Promise<vo
 
   if (!completed) {
     resetSession(ctx.session);
-    await ctx.reply(t(lang, "error.session_corrupted"));
+    await ctx.reply(t(lang, "error.session_corrupted"), {
+      reply_markup: buildMainMenuKeyboard(lang)
+    });
     return;
   }
 
@@ -957,7 +996,9 @@ const handleCompleted = async (ctx: BotContext): Promise<void> => {
       : 0;
     const review = await buildAnswerReviewPage(ctx, lang, page);
     if (!review) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: true });
+      await ctx.reply(t(lang, "test.mainMenu"), {
+        reply_markup: buildMainMenuKeyboard(lang)
+      });
       return;
     }
     if (data === REVIEW_ANSWERS_CALLBACK) {

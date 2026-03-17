@@ -16,7 +16,7 @@ import { TestRepository } from "../../db/repositories/test.repository.js";
 import { enterTestFlow } from "./test.handler.js";
 import { enterReviewFlow } from "./review.handler.js";
 import { storeUploadData, getUploadData, deleteAllUploadData } from "../utils/upload-storage.js";
-import { NAV_MAIN_MENU_CALLBACK, NAV_MYTESTS_CALLBACK } from "./commands.js";
+import { NAV_MAIN_MENU_CALLBACK, NAV_MYTESTS_CALLBACK, NAV_NEWTEST_CALLBACK } from "./commands.js";
 
 const testRepository = new TestRepository();
 
@@ -24,14 +24,18 @@ const DONE_ADDING_IMAGES_CALLBACK = "upload:images:done";
 const RETRY_GENERATION_CALLBACK = "upload:generation:retry";
 const CANCEL_RETRY_CALLBACK = "upload:generation:cancel";
 const TITLE_SKIP_CALLBACK = "upload:title:skip";
+const TITLE_CANCEL_CALLBACK = "upload:title:cancel";
 const TEXT_START_CALLBACK = "upload:text:start";
+const TEXT_CANCEL_CALLBACK = "upload:text:cancel";
 const QUESTION_COUNT_CALLBACK_PREFIX = "upload:count:";
+const PRESET_CALLBACK_PREFIX = "upload:preset:";
 const QUESTION_TYPES_CALLBACK_PREFIX = "upload:types:";
 const QUESTION_TYPES_CONFIRM_CALLBACK = "upload:types:confirm";
 const SHUFFLE_CALLBACK_PREFIX = "upload:shuffle:";
 const TIMER_CALLBACK_PREFIX = "upload:timer:";
 const ACTION_CALLBACK_PREFIX = "upload:action:";
 const SAVE_START_CALLBACK_PREFIX = "upload:save:start:";
+const UPLOAD_NAV_CALLBACK_PREFIX = "upload:nav:";
 const MAX_IMAGES = 10;
 const MAX_CUSTOM_QUESTION_COUNT = 50;
 const DEFAULT_MAX_FILE_SIZE_MB = 20;
@@ -81,8 +85,19 @@ const buildQuestionCountKeyboard = (lang: Language, defaultCount?: number): Inli
     .text("15", `${QUESTION_COUNT_CALLBACK_PREFIX}15`)
     .text("20", `${QUESTION_COUNT_CALLBACK_PREFIX}20`)
     .row()
-    .text(t(lang, "upload.btn.custom"), `${QUESTION_COUNT_CALLBACK_PREFIX}custom`);
+    .text(t(lang, "upload.btn.custom"), `${QUESTION_COUNT_CALLBACK_PREFIX}custom`)
+    .row()
+    .text(t(lang, "btn.back"), `${UPLOAD_NAV_CALLBACK_PREFIX}preset`)
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 };
+
+const buildPresetKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "upload.fast_path.use_defaults"), `${PRESET_CALLBACK_PREFIX}defaults`)
+    .row()
+    .text(t(lang, "upload.fast_path.customize"), `${PRESET_CALLBACK_PREFIX}customize`)
+    .row()
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 
 const buildQuestionTypesKeyboard = (
   selectedTypes: QuestionType[],
@@ -113,11 +128,17 @@ const buildQuestionTypesKeyboard = (
     .text(toggleLabel("short"), `${QUESTION_TYPES_CALLBACK_PREFIX}short`)
     .text(toggleLabel("fill"), `${QUESTION_TYPES_CALLBACK_PREFIX}fill`)
     .row()
-    .text(t(lang, "upload.btn.done"), QUESTION_TYPES_CONFIRM_CALLBACK);
+    .text(t(lang, "upload.btn.done"), QUESTION_TYPES_CONFIRM_CALLBACK)
+    .text(t(lang, "btn.back"), `${UPLOAD_NAV_CALLBACK_PREFIX}count`)
+    .row()
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 };
 
 const buildDoneAddingImagesKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard().text(t(lang, "upload.btn.doneAddingImages"), DONE_ADDING_IMAGES_CALLBACK);
+  new InlineKeyboard()
+    .text(t(lang, "upload.btn.doneAddingImages"), DONE_ADDING_IMAGES_CALLBACK)
+    .row()
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 
 const buildRetryKeyboard = (lang: Language, retryLabel?: string): InlineKeyboard =>
   new InlineKeyboard()
@@ -144,7 +165,10 @@ const buildShuffleKeyboard = (
     .row()
     .text(t(lang, "upload.shuffle.questions"), `${SHUFFLE_CALLBACK_PREFIX}questions`)
     .row()
-    .text(t(lang, "upload.shuffle.none"), `${SHUFFLE_CALLBACK_PREFIX}none`);
+    .text(t(lang, "upload.shuffle.none"), `${SHUFFLE_CALLBACK_PREFIX}none`)
+    .row()
+    .text(t(lang, "btn.back"), `${UPLOAD_NAV_CALLBACK_PREFIX}types`)
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 };
 
 const buildTimerKeyboard = (lang: Language, defaultSeconds?: number): InlineKeyboard => {
@@ -166,7 +190,10 @@ const buildTimerKeyboard = (lang: Language, defaultSeconds?: number): InlineKeyb
     .text(t(lang, "upload.timer.btn.60"), `${TIMER_CALLBACK_PREFIX}60`)
     .text(t(lang, "upload.timer.btn.180"), `${TIMER_CALLBACK_PREFIX}180`)
     .row()
-    .text(t(lang, "upload.timer.btn.none"), `${TIMER_CALLBACK_PREFIX}0`);
+    .text(t(lang, "upload.timer.btn.none"), `${TIMER_CALLBACK_PREFIX}0`)
+    .row()
+    .text(t(lang, "btn.back"), `${UPLOAD_NAV_CALLBACK_PREFIX}shuffle`)
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 };
 
 const buildActionKeyboard = (lang: Language): InlineKeyboard =>
@@ -175,7 +202,9 @@ const buildActionKeyboard = (lang: Language): InlineKeyboard =>
     .row()
     .text(t(lang, "upload.action.review"), `${ACTION_CALLBACK_PREFIX}review`)
     .row()
-    .text(t(lang, "upload.action.save"), `${ACTION_CALLBACK_PREFIX}save`);
+    .text(t(lang, "upload.action.save"), `${ACTION_CALLBACK_PREFIX}save`)
+    .row()
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 
 const buildSavedTestKeyboard = (testId: string, link: string, lang: Language): InlineKeyboard =>
   new InlineKeyboard()
@@ -184,6 +213,16 @@ const buildSavedTestKeyboard = (testId: string, link: string, lang: Language): I
     .row()
     .text(t(lang, "deadend.btn.my_tests"), NAV_MYTESTS_CALLBACK)
     .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
+
+const buildUploadCancelledKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "deadend.btn.create_test"), NAV_NEWTEST_CALLBACK)
+    .text(t(lang, "deadend.btn.main_menu"), NAV_MAIN_MENU_CALLBACK);
+
+const buildCountCustomKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard()
+    .text(t(lang, "btn.back"), `${UPLOAD_NAV_CALLBACK_PREFIX}count`)
+    .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
 
 type ImageFileInfo = { fileId: string; fileSize: number | undefined; mimeType: string };
 
@@ -284,6 +323,27 @@ const buildGenerateInput = (
 const buildUploadPromptKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard().text(t(lang, "upload.text.btn"), TEXT_START_CALLBACK);
 
+const buildFastPathSummary = (ctx: BotContext): string => {
+  const lang = ctx.lang();
+  const count = ctx.session.questionCount ?? ctx.user?.defaultQuestionCount ?? 10;
+  const types = formatQuestionTypes(ctx.session.questionTypes ?? ctx.user?.defaultQuestionTypes ?? ["mcq", "truefalse"], lang);
+  const timer = formatTimerLabel(ctx.session.timeLimitSeconds ?? ctx.user?.defaultTimeLimitSeconds ?? 0, lang);
+  const shuffle = formatShuffleLabel(getShuffleChoice(
+    ctx.session.shuffleQuestions ?? ctx.user?.defaultShuffleQuestions ?? false,
+    ctx.session.shuffleOptions ?? ctx.user?.defaultShuffleOptions ?? false
+  ), lang);
+
+  return t(lang, "upload.fast_path.summary", { count, types, timer, shuffle });
+};
+
+const showUploadCancelled = async (ctx: BotContext): Promise<void> => {
+  const lang = ctx.lang();
+  resetSession(ctx.session);
+  await ctx.reply(t(lang, "upload.cancelled"), {
+    reply_markup: buildUploadCancelledKeyboard(lang)
+  });
+};
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const getSessionStorageKey = (ctx: BotContext): string | null =>
@@ -366,6 +426,7 @@ export const enterUploadFlow = async (ctx: BotContext): Promise<void> => {
   ctx.session.timeLimitSeconds = ctx.user?.defaultTimeLimitSeconds ?? 0;
   ctx.session.shuffleQuestions = ctx.user?.defaultShuffleQuestions ?? false;
   ctx.session.shuffleOptions = ctx.user?.defaultShuffleOptions ?? false;
+  ctx.session.uploadAutoStart = undefined;
   transitionTo(ctx.session, "uploading", "enterUploadFlow");
   ctx.session.uploadStep = "waiting_file";
   logger.info("Upload flow entered", { event: "upload.flow.enter", userId: ctx.from?.id });
@@ -384,7 +445,7 @@ const handleWaitingFile = async (ctx: BotContext): Promise<void> => {
     ctx.session.uploadSourceType = "text";
     const lang = ctx.lang();
     await ctx.reply(t(lang, "upload.text.prompt"), {
-      reply_markup: new InlineKeyboard().text(t(lang, "btn.cancel"), "upload:text:cancel")
+      reply_markup: new InlineKeyboard().text(t(lang, "upload.text.cancel_btn"), TEXT_CANCEL_CALLBACK)
     });
     return;
   }
@@ -433,12 +494,9 @@ const handleWaitingText = async (ctx: BotContext): Promise<void> => {
   const lang = ctx.lang();
 
   // Cancel button
-  if (ctx.callbackQuery?.data === "upload:text:cancel") {
+  if (ctx.callbackQuery?.data === TEXT_CANCEL_CALLBACK) {
     await ctx.answerCallbackQuery();
-    resetSession(ctx.session);
-    await ctx.reply(t(lang, "upload.prompt"), { reply_markup: buildUploadPromptKeyboard(lang) });
-    transitionTo(ctx.session, "uploading", "handleWaitingText.cancel");
-    ctx.session.uploadStep = "waiting_file";
+    await showUploadCancelled(ctx);
     return;
   }
 
@@ -462,7 +520,7 @@ const handleWaitingText = async (ctx: BotContext): Promise<void> => {
   ctx.session.uploadSourceType = "text";
   logger.info("Text input received", { event: "upload.text.received", userId: ctx.from?.id, chars: text.length });
   await ctx.reply(t(lang, "upload.text.received", { chars: text.length }));
-  await transitionToWaitingCount(ctx);
+  await transitionToPresetChoice(ctx);
 };
 
 const handlePdfUpload = async (ctx: BotContext): Promise<void> => {
@@ -499,7 +557,7 @@ const handlePdfUpload = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
-  await transitionToWaitingCount(ctx);
+  await transitionToPresetChoice(ctx);
 };
 
 const handleFirstImage = async (ctx: BotContext): Promise<void> => {
@@ -567,7 +625,7 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
     }
     await ctx.answerCallbackQuery();
     logger.info("Upload images confirmed", { event: "upload.images.confirmed", userId: ctx.from?.id, imageCount: files.length });
-    await transitionToWaitingCount(ctx);
+    await transitionToPresetChoice(ctx);
     return;
   }
 
@@ -629,7 +687,7 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
 
   if (files.length >= MAX_IMAGES) {
     await ctx.reply(t(lang, "upload.imageLimitReachedAuto", { max: MAX_IMAGES }));
-    await transitionToWaitingCount(ctx);
+    await transitionToPresetChoice(ctx);
     return;
   }
 
@@ -640,12 +698,121 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
 // Step transitions
 // ---------------------------------------------------------------------------
 
+const transitionToPresetChoice = async (ctx: BotContext): Promise<void> => {
+  transitionTo(ctx.session, "configuring", "transitionToWaitingCount");
+  ctx.session.uploadStep = "waiting_preset";
+  await ctx.reply(
+    [t(ctx.lang(), "upload.fast_path.prompt"), "", buildFastPathSummary(ctx)].join("\n"),
+    { reply_markup: buildPresetKeyboard(ctx.lang()) }
+  );
+};
+
 const transitionToWaitingCount = async (ctx: BotContext): Promise<void> => {
   transitionTo(ctx.session, "configuring", "transitionToWaitingCount");
   ctx.session.uploadStep = "waiting_count";
   await ctx.reply(t(ctx.lang(), "upload.howManyQuestions"), {
     reply_markup: buildQuestionCountKeyboard(ctx.lang(), ctx.user?.defaultQuestionCount)
   });
+};
+
+const transitionToWaitingTypes = async (ctx: BotContext, preserveSelection = false): Promise<void> => {
+  const defaultTypes = (ctx.user?.defaultQuestionTypes as QuestionType[] | undefined) ?? ["mcq", "truefalse"];
+  if (!preserveSelection || !(ctx.session.questionTypes?.length)) {
+    ctx.session.questionTypes = [...defaultTypes];
+  }
+  ctx.session.uploadStep = "waiting_types";
+
+  const message = await ctx.reply(t(ctx.lang(), "upload.whichTypes"), {
+    reply_markup: buildQuestionTypesKeyboard(ctx.session.questionTypes, ctx.lang(), defaultTypes)
+  });
+  ctx.session.uploadTypesMessageId = message.message_id;
+};
+
+const handleUploadNavigation = async (ctx: BotContext): Promise<boolean> => {
+  const data = ctx.callbackQuery?.data;
+  if (!data?.startsWith(UPLOAD_NAV_CALLBACK_PREFIX)) {
+    return false;
+  }
+
+  await ctx.answerCallbackQuery();
+  const target = data.slice(UPLOAD_NAV_CALLBACK_PREFIX.length);
+
+  switch (target) {
+    case "preset":
+      await transitionToPresetChoice(ctx);
+      return true;
+    case "count":
+      await transitionToWaitingCount(ctx);
+      return true;
+    case "types":
+      await transitionToWaitingTypes(ctx, true);
+      return true;
+    case "shuffle":
+      await transitionToWaitingShuffle(ctx);
+      return true;
+    case "timer":
+      await transitionToWaitingTimer(ctx);
+      return true;
+    case "cancel":
+      await showUploadCancelled(ctx);
+      return true;
+    default:
+      return true;
+  }
+};
+
+const handleWaitingPreset = async (ctx: BotContext): Promise<void> => {
+  const data = ctx.callbackQuery?.data;
+
+  if (!data?.startsWith(PRESET_CALLBACK_PREFIX)) {
+    if (ctx.callbackQuery) await ctx.answerCallbackQuery();
+    await ctx.reply(t(ctx.lang(), "upload.usePresetButtons"));
+    return;
+  }
+
+  await ctx.answerCallbackQuery();
+  const choice = data.slice(PRESET_CALLBACK_PREFIX.length);
+
+  if (choice === "defaults") {
+    ctx.session.editingTitle = undefined;
+    ctx.session.uploadAutoStart = true;
+    logger.info("Upload fast path selected", { event: "upload.config.fast_path", userId: ctx.from?.id });
+    await runGeneration(ctx, false, "start");
+    return;
+  }
+
+  ctx.session.uploadAutoStart = false;
+  await transitionToWaitingCount(ctx);
+};
+
+const persistDraftTest = async (ctx: BotContext, lang: Language): Promise<string | null> => {
+  const draftQuestions = ctx.session.draftQuestions ?? [];
+  if (draftQuestions.length < 1) {
+    await ctx.reply(t(lang, "review.needAtLeastOneToast"));
+    return null;
+  }
+
+  if (!ctx.user) {
+    resetSession(ctx.session);
+    await ctx.reply(t(lang, "error.session_corrupted"));
+    return null;
+  }
+
+  const uploadStorageKeys = (ctx.session.uploadedFiles ?? []).map((f) => f.storageKey);
+  await deleteAllUploadData(ctx.redis, uploadStorageKeys);
+
+  const savedTest = await testRepository.create({
+    creatorId: ctx.user._id,
+    title: ctx.session.editingTitle ?? t(lang, "test.default_title"),
+    questions: draftQuestions,
+    sourceType: ctx.session.uploadSourceType ?? "images",
+    questionCount: draftQuestions.length,
+    shuffleQuestions: ctx.session.shuffleQuestions ?? false,
+    shuffleOptions: ctx.session.shuffleOptions ?? false,
+    timeLimitSeconds: ctx.session.timeLimitSeconds ?? 0
+  });
+
+  return String(savedTest._id);
 };
 
 // ---------------------------------------------------------------------------
@@ -666,7 +833,9 @@ const handleWaitingCount = async (ctx: BotContext): Promise<void> => {
 
   if (value === "custom") {
     ctx.session.uploadStep = "waiting_count_custom";
-    await ctx.reply(t(ctx.lang(), "upload.customCountPrompt"));
+    await ctx.reply(t(ctx.lang(), "upload.customCountPrompt"), {
+      reply_markup: buildCountCustomKeyboard(ctx.lang())
+    });
     return;
   }
 
@@ -681,6 +850,11 @@ const handleWaitingCount = async (ctx: BotContext): Promise<void> => {
 // ---------------------------------------------------------------------------
 
 const handleWaitingCountCustom = async (ctx: BotContext): Promise<void> => {
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery();
+    return;
+  }
+
   const rawValue = ctx.msg?.text?.trim();
 
   if (!rawValue) {
@@ -698,17 +872,6 @@ const handleWaitingCountCustom = async (ctx: BotContext): Promise<void> => {
   logger.info("Question count selected", { event: "upload.config.questionCount", userId: ctx.from?.id, count: parsed });
   ctx.session.questionCount = parsed;
   await transitionToWaitingTypes(ctx);
-};
-
-const transitionToWaitingTypes = async (ctx: BotContext): Promise<void> => {
-  const defaultTypes = (ctx.user?.defaultQuestionTypes as QuestionType[] | undefined) ?? ["mcq", "truefalse"];
-  ctx.session.questionTypes = [...defaultTypes];
-  ctx.session.uploadStep = "waiting_types";
-
-  const message = await ctx.reply(t(ctx.lang(), "upload.whichTypes"), {
-    reply_markup: buildQuestionTypesKeyboard(ctx.session.questionTypes, ctx.lang(), defaultTypes)
-  });
-  ctx.session.uploadTypesMessageId = message.message_id;
 };
 
 // ---------------------------------------------------------------------------
@@ -731,7 +894,7 @@ const handleWaitingShuffle = async (ctx: BotContext): Promise<void> => {
 
   if (!data?.startsWith(SHUFFLE_CALLBACK_PREFIX)) {
     if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-    await ctx.reply(t(ctx.lang(), "upload.useTypeButtons"));
+    await ctx.reply(t(ctx.lang(), "upload.useShuffleButtons"));
     return;
   }
 
@@ -777,7 +940,11 @@ const handleWaitingTimer = async (ctx: BotContext): Promise<void> => {
 // ---------------------------------------------------------------------------
 
 const buildTitleSkipKeyboard = (lang: Language): InlineKeyboard =>
-  new InlineKeyboard().text(t(lang, "upload.title.skip"), TITLE_SKIP_CALLBACK);
+  new InlineKeyboard()
+    .text(t(lang, "upload.title.skip"), TITLE_SKIP_CALLBACK)
+    .text(t(lang, "btn.back"), `${UPLOAD_NAV_CALLBACK_PREFIX}timer`)
+    .row()
+    .text(t(lang, "upload.title.cancel_btn"), TITLE_CANCEL_CALLBACK);
 
 const transitionToWaitingTitle = async (ctx: BotContext): Promise<void> => {
   ctx.session.uploadStep = "waiting_title";
@@ -796,6 +963,12 @@ const transitionToWaitingTitle = async (ctx: BotContext): Promise<void> => {
 };
 
 const handleWaitingTitle = async (ctx: BotContext): Promise<void> => {
+  if (ctx.callbackQuery?.data === TITLE_CANCEL_CALLBACK) {
+    await ctx.answerCallbackQuery();
+    await showUploadCancelled(ctx);
+    return;
+  }
+
   if (ctx.callbackQuery?.data === TITLE_SKIP_CALLBACK) {
     await ctx.answerCallbackQuery();
     ctx.session.editingTitle = undefined;
@@ -872,7 +1045,11 @@ const handleWaitingTypes = async (ctx: BotContext): Promise<void> => {
 // Generation
 // ---------------------------------------------------------------------------
 
-const runGeneration = async (ctx: BotContext, isRetry = false): Promise<void> => {
+const runGeneration = async (
+  ctx: BotContext,
+  isRetry = false,
+  completionMode: "menu" | "start" = "menu"
+): Promise<void> => {
   const { uploadedFiles, uploadedText, uploadSourceType, questionCount, questionTypes } = ctx.session;
   const lang = ctx.lang();
 
@@ -894,7 +1071,9 @@ const runGeneration = async (ctx: BotContext, isRetry = false): Promise<void> =>
     // Resolve base64 data from Redis for all uploaded files
     const base64Entries = await Promise.all(uploadedFiles.map((f) => getUploadData(ctx.redis, f.storageKey)));
     if (base64Entries.some((b) => b === null)) {
-      await ctx.reply(t(lang, "upload.expired"));
+      await ctx.reply(t(lang, "upload.expired"), {
+        reply_markup: buildUploadCancelledKeyboard(lang)
+      });
       resetSession(ctx.session);
       return;
     }
@@ -930,7 +1109,7 @@ const runGeneration = async (ctx: BotContext, isRetry = false): Promise<void> =>
 
     ctx.session.draftQuestions = questions;
     ctx.session.reviewIndex = 0;
-    ctx.session.uploadStep = "waiting_action";
+    ctx.session.uploadStep = completionMode === "start" ? undefined : "waiting_action";
     ctx.session.uploadTypesMessageId = undefined;
     if (uploadSourceType !== "text") {
       ctx.session.uploadSourceType = uploadedFiles![0]?.type === "pdf" ? "pdf" : "images";
@@ -956,6 +1135,21 @@ const runGeneration = async (ctx: BotContext, isRetry = false): Promise<void> =>
     }
   } finally {
     await ctx.api.deleteMessage(ctx.chatId!, thinkingMsg.message_id).catch(() => undefined);
+  }
+
+  if (completionMode === "start" && ctx.session.draftQuestions?.length) {
+    const testId = await persistDraftTest(ctx, lang);
+    if (!testId) return;
+
+    ctx.session.activeTestId = testId;
+    ctx.session.draftQuestions = [];
+    logger.info("Test started from upload fast path", {
+      event: "upload.fast_path.start",
+      userId: ctx.from?.id,
+      testId
+    });
+    await enterTestFlow(ctx, testId);
+    return;
   }
 
   if (ctx.session.uploadStep === "waiting_action") {
@@ -998,7 +1192,9 @@ const cancelRetry = async (ctx: BotContext): Promise<void> => {
   const storageKeys = (ctx.session.uploadedFiles ?? []).map((file) => file.storageKey);
   await deleteAllUploadData(ctx.redis, storageKeys);
   resetSession(ctx.session);
-  await ctx.reply(t(ctx.lang(), "upload.retry.cancelled"));
+  await ctx.reply(t(ctx.lang(), "upload.retry.cancelled"), {
+    reply_markup: buildUploadCancelledKeyboard(ctx.lang())
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -1024,34 +1220,8 @@ const handleWaitingAction = async (ctx: BotContext): Promise<void> => {
     return;
   }
 
-  const draftQuestions = ctx.session.draftQuestions ?? [];
-  if (draftQuestions.length < 1) {
-    await ctx.reply(t(lang, "review.needAtLeastOneToast"));
-    return;
-  }
-
-  if (!ctx.user) {
-    resetSession(ctx.session);
-    await ctx.reply(t(lang, "error.session_corrupted"));
-    return;
-  }
-
-  // Delete upload data from Redis — no longer needed after confirming action.
-  const uploadStorageKeys = (ctx.session.uploadedFiles ?? []).map((f) => f.storageKey);
-  await deleteAllUploadData(ctx.redis, uploadStorageKeys);
-
-  const savedTest = await testRepository.create({
-    creatorId: ctx.user._id,
-    title: ctx.session.editingTitle ?? t(lang, "test.default_title"),
-    questions: draftQuestions,
-    sourceType: ctx.session.uploadSourceType ?? "images",
-    questionCount: draftQuestions.length,
-    shuffleQuestions: ctx.session.shuffleQuestions ?? false,
-    shuffleOptions: ctx.session.shuffleOptions ?? false,
-    timeLimitSeconds: ctx.session.timeLimitSeconds ?? 0
-  });
-
-  const testId = String(savedTest._id);
+  const testId = await persistDraftTest(ctx, lang);
+  if (!testId) return;
 
   if (action === "start") {
     ctx.session.activeTestId = testId;
@@ -1085,6 +1255,10 @@ const _originalHandleWaitingFile = handleWaitingFile;
 // Re-export overridden router that handles image collection correctly.
 // (We patch the flow: if uploadedFiles is non-empty we're collecting more images.)
 export const uploadRouterFull = async (ctx: BotContext): Promise<void> => {
+  if (await handleUploadNavigation(ctx)) {
+    return;
+  }
+
   const step = ctx.session.uploadStep ?? "waiting_file";
   const hasFiles = (ctx.session.uploadedFiles?.length ?? 0) > 0;
 
@@ -1110,6 +1284,11 @@ export const uploadRouterFull = async (ctx: BotContext): Promise<void> => {
 
   if (step === "waiting_count") {
     await handleWaitingCount(ctx);
+    return;
+  }
+
+  if (step === "waiting_preset") {
+    await handleWaitingPreset(ctx);
     return;
   }
 
@@ -1147,7 +1326,7 @@ export const uploadRouterFull = async (ctx: BotContext): Promise<void> => {
 
     if (ctx.callbackQuery?.data === RETRY_GENERATION_CALLBACK) {
       await ctx.answerCallbackQuery();
-      await runGeneration(ctx, true);
+      await runGeneration(ctx, true, ctx.session.uploadAutoStart ? "start" : "menu");
       return;
     }
 

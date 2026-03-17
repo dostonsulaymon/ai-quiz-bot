@@ -136,6 +136,7 @@ export const registerHistoryHandler = (bot: Bot<BotContext>): void => {
       return;
     }
 
+    await ctx.replyWithChatAction("typing");
     const totalItems = await testSessionRepository.countByUser(ctx.user._id);
     if (totalItems === 0) {
       await ctx.reply(t(lang, "history.noSessions"), {
@@ -185,13 +186,13 @@ export const registerHistoryHandler = (bot: Bot<BotContext>): void => {
     const [sessionId, pageValue] = payload.split(":");
     const page = Number(pageValue ?? "1");
 
+    await ctx.answerCallbackQuery();
+    await ctx.replyWithChatAction("typing");
     const result = await renderHistoryDetails(sessionId ?? "", page, lang, ctx.user._id);
     if (!result) {
-      await ctx.answerCallbackQuery();
       await ctx.reply(t(lang, "error.test_deleted"));
       return;
     }
-    await ctx.answerCallbackQuery();
     await safeEditMessage(ctx, result.text, { reply_markup: result.keyboard });
   });
 

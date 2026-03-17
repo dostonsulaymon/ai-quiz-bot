@@ -7,12 +7,11 @@ import { resetSession } from "../types.js";
 import { enterTestFlow, LEADERBOARD_CALLBACK_PREFIX } from "./test.handler.js";
 import { enterEditFlow } from "./edit.handler.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
-import { formatDate } from "../utils/format.js";
 import { safeEditMessage } from "../utils/telegram.js";
 import { generateTestPDF } from "../utils/pdf-export.js";
 import { NAV_NEWTEST_CALLBACK } from "./commands.js";
 
-const MYTESTS_PAGE_SIZE = 5;
+const MYTESTS_PAGE_SIZE = 1;
 const MYTESTS_PAGE_CALLBACK_PREFIX = "mytests:page:";
 const MYTESTS_SHARE_CALLBACK_PREFIX = "mytests:share:";
 const MYTESTS_MANAGE_CALLBACK_PREFIX = "mytests:manage:";
@@ -25,17 +24,26 @@ const MYTESTS_BACK_CALLBACK_PREFIX = "mytests:back:";
 const MYTESTS_EDIT_CALLBACK_PREFIX = "mytests:edit:";
 const MYTESTS_DUPLICATE_CALLBACK_PREFIX = "mytests:duplicate:";
 const MYTESTS_EXPORT_CALLBACK_PREFIX = "mytests:export:";
+const MYTESTS_ANALYTICS_CALLBACK_PREFIX = "mytests:analytics:";
 const MYTESTS_NOOP_CALLBACK = "mytests:noop";
 
 const testRepository = new TestRepository();
 const testSessionRepository = new TestSessionRepository();
 const leaderboardRepository = new LeaderboardRepository();
 
-const buildPaginationRow = (page: number, totalPages: number, lang: Language): InlineKeyboard =>
-  new InlineKeyboard()
-    .text("◀", `${MYTESTS_PAGE_CALLBACK_PREFIX}${Math.max(1, page - 1)}:${page}`)
-    .text(t(lang, "pagination.page", { page, total: totalPages }), MYTESTS_NOOP_CALLBACK)
-    .text("▶", `${MYTESTS_PAGE_CALLBACK_PREFIX}${Math.min(totalPages, page + 1)}:${page}`);
+const buildPaginationRow = (page: number, totalPages: number): InlineKeyboard => {
+  const keyboard = new InlineKeyboard();
+
+  if (page > 1) {
+    keyboard.text("◀", `${MYTESTS_PAGE_CALLBACK_PREFIX}${page - 1}:${page}`);
+  }
+
+  if (page < totalPages) {
+    keyboard.text("▶", `${MYTESTS_PAGE_CALLBACK_PREFIX}${page + 1}:${page}`);
+  }
+
+  return keyboard;
+};
 
 const renderMyTestsPage = async (userId: string, page: number, lang: Language): Promise<{ text: string; keyboard: InlineKeyboard }> => {
   const totalItems = await testRepository.countByCreator(userId);
@@ -67,15 +75,14 @@ const renderMyTestsPage = async (userId: string, page: number, lang: Language): 
 
     const row = [
       t(lang, "mytests.testRow", {
-        n: index + 1,
+        n: (currentPage - 1) * MYTESTS_PAGE_SIZE + index + 1,
         title: test.title?.trim() || t(lang, "common.untitled"),
         q: test.questions.length
       }),
-      t(lang, "mytests.testRowTypes", { 
-        types: formatQuestionTypes(test.questions.map((question) => question.type), lang),
-        date: formatDate(test.createdAt, false, lang) 
-      }),
-      t(lang, "mytests.testRowMeta", { participants: participantHint })
+      t(lang, "mytests.testRowMeta", {
+        participants: participantHint,
+        types: formatQuestionTypes(test.questions.map((question) => question.type), lang)
+      })
     ];
 
     row.push("");
@@ -87,15 +94,21 @@ const renderMyTestsPage = async (userId: string, page: number, lang: Language): 
     const testId = String(test._id);
     keyboard
       .text(t(lang, "mytests.btn.start_test"), `${MYTESTS_TAKE_CALLBACK_PREFIX}${testId}`)
-      .text(t(lang, "mytests.btn.share"), `${MYTESTS_SHARE_CALLBACK_PREFIX}${testId}:${currentPage}`)
       .text(t(lang, "mytests.btn.manage"), `${MYTESTS_MANAGE_CALLBACK_PREFIX}${testId}:${currentPage}`)
       .row();
   });
 
-  keyboard.append(buildPaginationRow(currentPage, totalPages, lang));
+  if (totalPages > 1) {
+    keyboard.row().append(buildPaginationRow(currentPage, totalPages));
+  }
 
   return {
-    text: [t(lang, "mytests.header"), "", ...lines].join("\n").trim(),
+    text: [
+      t(lang, "mytests.header"),
+      t(lang, "mytests.pageSummary", { page: currentPage, total: totalPages }),
+      "",
+      ...lines
+    ].join("\n").trim(),
     keyboard
   };
 };
@@ -112,6 +125,9 @@ const renderMoreActions = async (userId: string, testId: string, page: number, l
   const participantCount = await leaderboardRepository.getParticipantCount(testId).catch(() => 0);
 
   const keyboard = new InlineKeyboard()
+    .text(t(lang, "mytests.btn.start_test"), `${MYTESTS_TAKE_CALLBACK_PREFIX}${testId}`)
+    .text(t(lang, "mytests.btn.share"), `${MYTESTS_SHARE_CALLBACK_PREFIX}${testId}:${page}`)
+    .row()
     .text(t(lang, "mytests.btn.edit"), `${MYTESTS_EDIT_CALLBACK_PREFIX}${testId}`)
     .text(t(lang, "mytests.btn.duplicate"), `${MYTESTS_DUPLICATE_CALLBACK_PREFIX}${testId}:${page}`)
     .row()
@@ -124,6 +140,8 @@ const renderMoreActions = async (userId: string, testId: string, page: number, l
   }
 
   keyboard
+    .text("📊 " + t(lang, "leaderboard.btn"), `${MYTESTS_ANALYTICS_CALLBACK_PREFIX}${testId}:${page}`)
+    .row()
     .text(t(lang, "mytests.btn.delete"), `${MYTESTS_DELETE_CALLBACK_PREFIX}${testId}:${page}`)
     .row()
     .text(t(lang, "mytests.btn.back_list"), `${MYTESTS_BACK_CALLBACK_PREFIX}${page}`);
@@ -186,6 +204,36 @@ const startOwnedTest = async (ctx: BotContext, testId: string): Promise<void> =>
   await enterTestFlow(ctx, testId);
 };
 
+const renderAnalytics = async (testId: string, lang: Language): Promise<{ text: string; keyboard: InlineKeyboard }> => {
+  const test = await testRepository.findById(testId);
+  if (!test) return { text: t(lang, "mytests.testUnavailable"), keyboard: new InlineKeyboard() };
+
+  const entries = await leaderboardRepository.getTopEntries(testId, 1000);
+  const title = test.title?.trim() || t(lang, "common.untitledTest");
+
+  if (entries.length === 0) {
+    return {
+      text: t(lang, "mytests.analytics.title", { title }) + "\n\n" + t(lang, "mytests.analytics.no_data"),
+      keyboard: new InlineKeyboard().text(t(lang, "btn.back"), `${MYTESTS_MANAGE_CALLBACK_PREFIX}${testId}:1`)
+    };
+  }
+
+  const totalParticipants = entries.length;
+  const avgScore = Math.round(entries.reduce((acc, e) => acc + e.score, 0) / totalParticipants);
+  const totalCorrect = entries.reduce((acc, e) => acc + e.correctCount, 0);
+
+  const lines = [
+    t(lang, "mytests.analytics.title", { title }),
+    "",
+    t(lang, "mytests.analytics.participants", { count: totalParticipants }),
+    t(lang, "mytests.analytics.avg_score", { score: avgScore }),
+    t(lang, "mytests.analytics.correct_count", { count: totalCorrect })
+  ];
+
+  const keyboard = new InlineKeyboard().text(t(lang, "btn.back"), `${MYTESTS_MANAGE_CALLBACK_PREFIX}${testId}:1`);
+  return { text: lines.join("\n"), keyboard };
+};
+
 export const showMyTestsPage = async (ctx: BotContext, page: number = 1): Promise<void> => {
   if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
     await ctx.reply(t(ctx.lang(), "cmd.private_only"));
@@ -197,6 +245,7 @@ export const showMyTestsPage = async (ctx: BotContext, page: number = 1): Promis
     return;
   }
 
+  await ctx.replyWithChatAction("typing");
   const userId = String(ctx.user._id);
   const totalItems = await testRepository.countByCreator(ctx.user._id);
   if (totalItems === 0) {

@@ -317,7 +317,7 @@ export const runGroupAutoAdvance = async (
     const completed = await groupSessionRepository.complete(rechecked._id);
     if (completed) await sendGroupCompletionViaApi(api, chatId, completed, test, lang);
   } else {
-    const advanced = await groupSessionRepository.advance(rechecked._id);
+    const advanced = await groupSessionRepository.advance(rechecked._id, qIdx);
     if (advanced) await sendGroupQuestionViaApi(api, chatId, advanced, test, lang);
   }
 };
@@ -737,7 +737,7 @@ const handleGroupNext = async (ctx: BotContext): Promise<void> => {
       await completeGroupSession(ctx, completed, test, hostLang);
     }
   } else {
-    const advanced = await groupSessionRepository.advance(session._id);
+    const advanced = await groupSessionRepository.advance(session._id, qIdx);
     if (advanced) {
       await sendGroupQuestion(ctx, advanced, test, hostLang);
     }

@@ -20,13 +20,17 @@ const EDIT_SAVE_CB = "edit:save";
 const EDIT_CANCEL_CB = "edit:cancel";
 const EDIT_SAVE_YES_CB = "edit:save:yes";
 const EDIT_SAVE_NO_CB = "edit:save:no";
+const EDIT_MENU_BACK_CB = "edit:menu";
 const EDIT_SHUFFLE_PREFIX = "edit:sh:";
+const EDIT_TITLE_CANCEL_CB = "edit:title:cancel";
 const EDIT_Q_PREV_CB = "edit:q:prev";
 const EDIT_Q_NEXT_CB = "edit:q:next";
 const EDIT_Q_EDIT_CB = "edit:q:edit";
+const EDIT_Q_ANSWER_CANCEL_CB = "edit:q:answer:cancel";
 const EDIT_Q_DELETE_CB = "edit:q:del";
 const EDIT_Q_BACK_CB = "edit:q:back";
 const EDIT_Q_ADD_CB = "edit:q:add";
+const EDIT_Q_ADD_CANCEL_CB = "edit:q:add:cancel";
 const EDIT_Q_NOOP_CB = "edit:q:noop";
 const EDIT_Q_ADD_TYPE_PREFIX = "edit:q:add:type:";
 
@@ -56,7 +60,9 @@ const buildShuffleKeyboard = (lang: Language): InlineKeyboard =>
     .row()
     .text(t(lang, "upload.shuffle.questions"), `${EDIT_SHUFFLE_PREFIX}questions`)
     .row()
-    .text(t(lang, "upload.shuffle.none"), `${EDIT_SHUFFLE_PREFIX}none`);
+    .text(t(lang, "upload.shuffle.none"), `${EDIT_SHUFFLE_PREFIX}none`)
+    .row()
+    .text(t(lang, "btn.back"), EDIT_MENU_BACK_CB);
 
 const buildQuestionCardKeyboard = (index: number, total: number, lang: Language): InlineKeyboard =>
   new InlineKeyboard()
@@ -83,6 +89,15 @@ const buildAddTypeKeyboard = (lang: Language): InlineKeyboard =>
     .row()
     .text(t(lang, "upload.type.short"), `${EDIT_Q_ADD_TYPE_PREFIX}short`)
     .text(t(lang, "upload.type.fill"), `${EDIT_Q_ADD_TYPE_PREFIX}fill`);
+
+const buildTitleCancelKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "edit.cancel_btn"), EDIT_TITLE_CANCEL_CB);
+
+const buildEditAnswerCancelKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "edit.cancel_btn"), EDIT_Q_ANSWER_CANCEL_CB);
+
+const buildAddQuestionCancelKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "edit.cancel_btn"), EDIT_Q_ADD_CANCEL_CB);
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -205,6 +220,27 @@ const showEditMenu = async (ctx: BotContext): Promise<void> => {
   await ctx.reply(formatEditMenu(title, count, lang), { reply_markup: buildEditMenuKeyboard(lang) });
 };
 
+const restoreQuestionsView = async (ctx: BotContext): Promise<void> => {
+  const lang = ctx.lang();
+  const questions = ctx.session.editingDraft ?? [];
+  const messageId = ctx.session.editingMessageId;
+
+  if (questions.length === 0 || !messageId) {
+    await showEditMenu(ctx);
+    return;
+  }
+
+  const index = Math.min(ctx.session.editingQuestionIndex ?? 0, questions.length - 1);
+  ctx.session.editingQuestionIndex = index;
+  await safeEditMessageViaApi(
+    ctx.api,
+    ctx.chatId!,
+    messageId,
+    formatQuestionCard(questions[index]!, index, questions.length, lang),
+    { reply_markup: buildQuestionCardKeyboard(index, questions.length, lang) }
+  );
+};
+
 // ---------------------------------------------------------------------------
 // Step: menu
 // ---------------------------------------------------------------------------
@@ -221,7 +257,7 @@ const handleMenu = async (ctx: BotContext): Promise<void> => {
   if (data === EDIT_TITLE_CB) {
     await ctx.answerCallbackQuery();
     ctx.session.editingStep = "title";
-    await ctx.reply(t(lang, "edit.title.prompt"));
+    await ctx.reply(t(lang, "edit.title.prompt"), { reply_markup: buildTitleCancelKeyboard(lang) });
     return;
   }
 
@@ -265,11 +301,19 @@ const handleMenu = async (ctx: BotContext): Promise<void> => {
 
 const handleTitle = async (ctx: BotContext): Promise<void> => {
   const lang = ctx.lang();
+
+  if (ctx.callbackQuery?.data === EDIT_TITLE_CANCEL_CB) {
+    await ctx.answerCallbackQuery();
+    await ctx.deleteMessage().catch(() => undefined);
+    await showEditMenu(ctx);
+    return;
+  }
+
   const text = ctx.msg?.text?.trim();
 
   if (!text) {
     if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-    await ctx.reply(t(lang, "edit.title.prompt"));
+    await ctx.reply(t(lang, "edit.title.prompt"), { reply_markup: buildTitleCancelKeyboard(lang) });
     return;
   }
 
@@ -287,9 +331,15 @@ const handleShuffle = async (ctx: BotContext): Promise<void> => {
   const lang = ctx.lang();
   const data = ctx.callbackQuery?.data;
 
+  if (data === EDIT_MENU_BACK_CB) {
+    await ctx.answerCallbackQuery();
+    await showEditMenu(ctx);
+    return;
+  }
+
   if (!data?.startsWith(EDIT_SHUFFLE_PREFIX)) {
     if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-    await ctx.reply(t(lang, "upload.useTypeButtons"));
+    await ctx.reply(t(lang, "upload.useShuffleButtons"));
     return;
   }
 
@@ -432,7 +482,7 @@ const handleQuestionsIdle = async (ctx: BotContext): Promise<void> => {
           ? t(lang, "review.editHintTrueFalse")
           : t(lang, "review.editHintOpen");
 
-    await ctx.reply(hint);
+    await ctx.reply(hint, { reply_markup: buildEditAnswerCancelKeyboard(lang) });
     return;
   }
 
@@ -475,6 +525,15 @@ const handleQuestionsIdle = async (ctx: BotContext): Promise<void> => {
 
 const handleEditingAnswer = async (ctx: BotContext): Promise<void> => {
   const lang = ctx.lang();
+
+  if (ctx.callbackQuery?.data === EDIT_Q_ANSWER_CANCEL_CB) {
+    ctx.session.editingQuestionSubState = "idle";
+    await ctx.answerCallbackQuery();
+    await ctx.deleteMessage().catch(() => undefined);
+    await restoreQuestionsView(ctx);
+    return;
+  }
+
   const rawAnswer = ctx.msg?.text?.trim();
 
   if (!rawAnswer) {
@@ -537,6 +596,15 @@ const handleAddingQuestion = async (ctx: BotContext): Promise<void> => {
   const data = ctx.callbackQuery?.data;
   const text = ctx.msg?.text?.trim();
 
+  if (data === EDIT_Q_ADD_CANCEL_CB) {
+    ctx.session.editingQuestionSubState = "idle";
+    ctx.session.editingNewQuestion = undefined;
+    await ctx.answerCallbackQuery();
+    await ctx.deleteMessage().catch(() => undefined);
+    await restoreQuestionsView(ctx);
+    return;
+  }
+
   if (subState === "adding_type") {
     if (!data?.startsWith(EDIT_Q_ADD_TYPE_PREFIX)) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery();
@@ -547,24 +615,24 @@ const handleAddingQuestion = async (ctx: BotContext): Promise<void> => {
     const type = data.slice(EDIT_Q_ADD_TYPE_PREFIX.length) as QuestionType;
     ctx.session.editingNewQuestion = { ...ctx.session.editingNewQuestion, type };
     ctx.session.editingQuestionSubState = "adding_text";
-    await ctx.reply(t(lang, "edit.add.question_prompt"));
+    await ctx.reply(t(lang, "edit.add.question_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
     return;
   }
 
   if (subState === "adding_text") {
     if (!text) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-      await ctx.reply(t(lang, "edit.add.question_prompt"));
+      await ctx.reply(t(lang, "edit.add.question_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
       return;
     }
     ctx.session.editingNewQuestion = { ...ctx.session.editingNewQuestion, question: text };
     const type = ctx.session.editingNewQuestion?.type;
     if (type === "mcq") {
       ctx.session.editingQuestionSubState = "adding_opt_a";
-      await ctx.reply(t(lang, "edit.add.option_a_prompt"));
+      await ctx.reply(t(lang, "edit.add.option_a_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
     } else {
       ctx.session.editingQuestionSubState = "adding_answer";
-      await ctx.reply(t(lang, "edit.add.answer_prompt"));
+      await ctx.reply(t(lang, "edit.add.answer_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
     }
     return;
   }
@@ -572,55 +640,55 @@ const handleAddingQuestion = async (ctx: BotContext): Promise<void> => {
   if (subState === "adding_opt_a") {
     if (!text) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-      await ctx.reply(t(lang, "edit.add.option_a_prompt"));
+      await ctx.reply(t(lang, "edit.add.option_a_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
       return;
     }
     ctx.session.editingNewQuestion = { ...ctx.session.editingNewQuestion, optionA: text };
     ctx.session.editingQuestionSubState = "adding_opt_b";
-    await ctx.reply(t(lang, "edit.add.option_b_prompt"));
+    await ctx.reply(t(lang, "edit.add.option_b_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
     return;
   }
 
   if (subState === "adding_opt_b") {
     if (!text) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-      await ctx.reply(t(lang, "edit.add.option_b_prompt"));
+      await ctx.reply(t(lang, "edit.add.option_b_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
       return;
     }
     ctx.session.editingNewQuestion = { ...ctx.session.editingNewQuestion, optionB: text };
     ctx.session.editingQuestionSubState = "adding_opt_c";
-    await ctx.reply(t(lang, "edit.add.option_c_prompt"));
+    await ctx.reply(t(lang, "edit.add.option_c_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
     return;
   }
 
   if (subState === "adding_opt_c") {
     if (!text) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-      await ctx.reply(t(lang, "edit.add.option_c_prompt"));
+      await ctx.reply(t(lang, "edit.add.option_c_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
       return;
     }
     ctx.session.editingNewQuestion = { ...ctx.session.editingNewQuestion, optionC: text };
     ctx.session.editingQuestionSubState = "adding_opt_d";
-    await ctx.reply(t(lang, "edit.add.option_d_prompt"));
+    await ctx.reply(t(lang, "edit.add.option_d_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
     return;
   }
 
   if (subState === "adding_opt_d") {
     if (!text) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-      await ctx.reply(t(lang, "edit.add.option_d_prompt"));
+      await ctx.reply(t(lang, "edit.add.option_d_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
       return;
     }
     ctx.session.editingNewQuestion = { ...ctx.session.editingNewQuestion, optionD: text };
     ctx.session.editingQuestionSubState = "adding_answer";
-    await ctx.reply(t(lang, "edit.add.answer_prompt"));
+    await ctx.reply(t(lang, "edit.add.answer_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
     return;
   }
 
   if (subState === "adding_answer") {
     if (!text) {
       if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-      await ctx.reply(t(lang, "edit.add.answer_prompt"));
+      await ctx.reply(t(lang, "edit.add.answer_prompt"), { reply_markup: buildAddQuestionCancelKeyboard(lang) });
       return;
     }
 

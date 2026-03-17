@@ -8,17 +8,20 @@ import { enterTestFlow } from "./test.handler.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import { safeEditMessage } from "../utils/telegram.js";
 
-const MYCLASSES_PAGE_SIZE = 5;
+const MYCLASSES_PAGE_SIZE = 2;
 const CLASS_TESTS_PAGE_SIZE = 5;
 
 const MYCLASSES_PAGE_PREFIX = "myclasses:page:";
 const MYCLASSES_LIST_PREFIX = "myclasses:list:";
 const MYCLASSES_NEW_CB = "myclasses:new";
+const MYCLASSES_NAME_CANCEL_CB = "myclasses:name:cancel";
 const MYCLASSES_OPEN_PREFIX = "myclasses:open:";
 const MYCLASSES_VIEW_PREFIX = "myclasses:view:";
 const MYCLASSES_EDIT_PREFIX = "myclasses:edit:";
 const MYCLASSES_SHARE_PREFIX = "myclasses:share:";
 const MYCLASSES_DELETE_PREFIX = "myclasses:delete:";
+const MYCLASSES_DELETE_CONFIRM_PREFIX = "myclasses:delete:confirm:";
+const MYCLASSES_DELETE_CANCEL_PREFIX = "myclasses:delete:cancel:";
 const MYCLASSES_ADD_TEST_PREFIX = "myclasses:add_test:";
 const MYCLASSES_ADD_TEST_PAGE_PREFIX = "myclasses:add_test_page:";
 const MYCLASSES_ADD_PICK_PREFIX = "myclasses:add_pick:";
@@ -43,11 +46,31 @@ const buildPaginationRow = (page: number, totalPages: number, prefix: string, ex
     .text(t(lang, "pagination.page", { page, total: totalPages }), MYCLASSES_NOOP_CB)
     .text("▶", `${prefix}${Math.min(totalPages, page + 1)}${extra ? `:${extra}` : ""}`);
 
+const buildCompactPaginationRow = (page: number, totalPages: number, prefix: string, extra?: string): InlineKeyboard => {
+  const keyboard = new InlineKeyboard();
+
+  if (page > 1) {
+    keyboard.text("◀", `${prefix}${page - 1}${extra ? `:${extra}` : ""}`);
+  }
+
+  if (page < totalPages) {
+    keyboard.text("▶", `${prefix}${page + 1}${extra ? `:${extra}` : ""}`);
+  }
+
+  return keyboard;
+};
+
+const truncateLabel = (value: string, max = 24): string =>
+  value.length <= max ? value : `${value.slice(0, max - 1).trimEnd()}…`;
+
 const buildClassPreviewPaginationRow = (classId: string, page: number, totalPages: number, lang: Language): InlineKeyboard =>
   new InlineKeyboard()
     .text("◀", `${MYCLASSES_PREVIEW_BROWSE_PREFIX}${classId}:${Math.max(1, page - 1)}`)
     .text(t(lang, "pagination.page", { page, total: totalPages }), MYCLASSES_NOOP_CB)
     .text("▶", `${MYCLASSES_PREVIEW_BROWSE_PREFIX}${classId}:${Math.min(totalPages, page + 1)}`);
+
+const buildClassNameCancelKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "myclasses.cancel_btn"), MYCLASSES_NAME_CANCEL_CB);
 
 const loadTestsByIds = async (testIds: Types.ObjectId[]) => testRepository.findByIdsOrdered(testIds);
 
@@ -69,26 +92,26 @@ const renderMyClassesPage = async (
   const classes = await classRepository.findByCreatorPaginated(userId, currentPage, MYCLASSES_PAGE_SIZE);
 
   const lines = [
-    "━━━━━━━━━━━━━━━━",
     t(lang, "myclasses.title"),
-    "━━━━━━━━━━━━━━━━",
-    ...classes.map((item, index) =>
-      `${index + 1}. ${item.title} (${t(lang, "myclasses.test_count", { count: item.testIds.length })})`
-    ),
-    "━━━━━━━━━━━━━━━━"
+    t(lang, "myclasses.pageSummary", { page: currentPage, total: totalPages }),
+    "",
+    ...classes.flatMap((item, index) => [
+      `${(currentPage - 1) * MYCLASSES_PAGE_SIZE + index + 1}. ${item.title}`,
+      t(lang, "myclasses.list.meta", { count: item.testIds.length }),
+      ""
+    ])
   ];
 
   const keyboard = new InlineKeyboard().text(t(lang, "myclasses.btn.new"), MYCLASSES_NEW_CB).row();
   classes.forEach((item) => {
     const classId = String(item._id);
     keyboard
-      .text(t(lang, "myclasses.btn.open_class"), `${MYCLASSES_OPEN_PREFIX}${classId}:${currentPage}`)
-      .text(t(lang, "myclasses.btn.edit"), `${MYCLASSES_EDIT_PREFIX}${classId}:${currentPage}`)
-      .text(t(lang, "myclasses.btn.share"), `${MYCLASSES_SHARE_PREFIX}${classId}:${currentPage}`)
-      .text(t(lang, "myclasses.btn.delete"), `${MYCLASSES_DELETE_PREFIX}${classId}:${currentPage}`)
+      .text(t(lang, "myclasses.btn.open_class_item", { title: truncateLabel(item.title) }), `${MYCLASSES_OPEN_PREFIX}${classId}:${currentPage}`)
       .row();
   });
-  keyboard.append(buildPaginationRow(currentPage, totalPages, MYCLASSES_PAGE_PREFIX, undefined, lang));
+  if (totalPages > 1) {
+    keyboard.append(buildCompactPaginationRow(currentPage, totalPages, MYCLASSES_PAGE_PREFIX));
+  }
 
   return { text: lines.join("\n"), keyboard };
 };
@@ -124,6 +147,9 @@ const renderClassView = async (
   const keyboard = new InlineKeyboard()
     .text(t(lang, "myclasses.btn.add_test"), `${MYCLASSES_ADD_TEST_PREFIX}1:${page}`)
     .text(t(lang, "myclasses.btn.share_class"), `${MYCLASSES_SHARE_PREFIX}${classId}:${page}`)
+    .row()
+    .text(t(lang, "myclasses.btn.edit"), `${MYCLASSES_EDIT_PREFIX}${classId}:${page}`)
+    .text(t(lang, "myclasses.btn.delete"), `${MYCLASSES_DELETE_PREFIX}${classId}:${page}`)
     .row()
     .text(t(lang, "btn.back"), `${MYCLASSES_LIST_PREFIX}${page}`);
 
@@ -169,6 +195,23 @@ const renderAvailableTestsPage = async (
     .append(buildPaginationRow(currentPage, totalPages, MYCLASSES_ADD_TEST_PAGE_PREFIX, String(backPage), lang));
 
   return { text: lines.join("\n"), keyboard };
+};
+
+const renderDeleteConfirm = async (
+  classId: string,
+  userId: Types.ObjectId,
+  page: number,
+  lang: Language
+): Promise<{ text: string; keyboard: InlineKeyboard } | null> => {
+  const item = await classRepository.findByIdAndCreator(classId, userId);
+  if (!item) return null;
+
+  return {
+    text: t(lang, "myclasses.deleteConfirm", { title: item.title }),
+    keyboard: new InlineKeyboard()
+      .text(t(lang, "myclasses.btn.confirmDelete"), `${MYCLASSES_DELETE_CONFIRM_PREFIX}${classId}:${page}`)
+      .text(t(lang, "btn.cancel"), `${MYCLASSES_DELETE_CANCEL_PREFIX}${classId}:${page}`)
+  };
 };
 
 const renderPublicClassPreview = async (
@@ -239,8 +282,22 @@ export const showMyClassesPage = async (ctx: BotContext, page = 1): Promise<void
     return;
   }
 
+  await ctx.replyWithChatAction("typing");
   const { text, keyboard } = await renderMyClassesPage(String(ctx.user._id), page, lang);
   await ctx.reply(text, { reply_markup: keyboard });
+};
+
+const recoverToClassesList = async (ctx: BotContext, page: number, messageKey: "error.session_not_found" | "error.not_owner"): Promise<void> => {
+  const lang = ctx.lang();
+  if (!ctx.user) {
+    await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+    return;
+  }
+
+  ctx.session.activeClassId = undefined;
+  const { text, keyboard } = await renderMyClassesPage(String(ctx.user._id), page, lang);
+  await ctx.answerCallbackQuery({ text: t(lang, messageKey), show_alert: false });
+  await safeEditMessage(ctx, text, { reply_markup: keyboard });
 };
 
 export const showClassPreviewFromShareCode = async (ctx: BotContext, rawCode: string): Promise<void> => {
@@ -250,6 +307,7 @@ export const showClassPreviewFromShareCode = async (ctx: BotContext, rawCode: st
     return;
   }
 
+  await ctx.replyWithChatAction("typing");
   const result = await renderPublicClassPreview(shareCode, ctx.lang());
   if (!result) {
     await ctx.reply(t(ctx.lang(), "commands.testLinkInvalid"));
@@ -283,7 +341,9 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     ctx.session.classEditingId = undefined;
     ctx.session.activeClassId = undefined;
     await ctx.answerCallbackQuery();
-    await ctx.reply(t(ctx.lang(), "myclasses.new.prompt"));
+    await ctx.reply(t(ctx.lang(), "myclasses.new.prompt"), {
+      reply_markup: buildClassNameCancelKeyboard(ctx.lang())
+    });
   });
 
   bot.callbackQuery(new RegExp(`^${MYCLASSES_OPEN_PREFIX}`), async (ctx) => {
@@ -312,16 +372,16 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     }
     const classId = ctx.session.activeClassId;
     if (!classId) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: false });
+      await recoverToClassesList(ctx, 1, "error.session_not_found");
       return;
     }
     const page = Number(ctx.callbackQuery.data.slice(MYCLASSES_VIEW_PREFIX.length));
     const result = await renderClassView(classId, ctx.user._id, page, lang);
-    await ctx.answerCallbackQuery();
     if (!result) {
-      await ctx.reply(t(lang, "error.not_owner"));
+      await recoverToClassesList(ctx, page, "error.not_owner");
       return;
     }
+    await ctx.answerCallbackQuery();
     await safeEditMessage(ctx, result.text, { reply_markup: result.keyboard });
   });
 
@@ -355,7 +415,9 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     ctx.session.classEditingId = String(owned._id);
     ctx.session.activeClassId = String(owned._id);
     await ctx.answerCallbackQuery();
-    await ctx.reply(t(lang, "myclasses.edit.prompt", { title: owned.title }));
+    await ctx.reply(t(lang, "myclasses.edit.prompt", { title: owned.title }), {
+      reply_markup: buildClassNameCancelKeyboard(lang)
+    });
   });
 
   bot.callbackQuery(new RegExp(`^${MYCLASSES_SHARE_PREFIX}`), async (ctx) => {
@@ -391,15 +453,53 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     }
     const payload = ctx.callbackQuery.data.slice(MYCLASSES_DELETE_PREFIX.length);
     const [classId, pageValue] = payload.split(":");
+    const page = Number(pageValue ?? "1");
+    const result = await renderDeleteConfirm(classId ?? "", ctx.user._id, page, lang);
+    if (!result) {
+      await recoverToClassesList(ctx, page, "error.not_owner");
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(ctx, result.text, { reply_markup: result.keyboard });
+  });
+
+  bot.callbackQuery(new RegExp(`^${MYCLASSES_DELETE_CONFIRM_PREFIX}`), async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+    const payload = ctx.callbackQuery.data.slice(MYCLASSES_DELETE_CONFIRM_PREFIX.length);
+    const [classId, pageValue] = payload.split(":");
     const owned = await classRepository.findByIdAndCreator(classId ?? "", ctx.user._id);
+    const page = Number(pageValue ?? "1");
     if (!owned) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.not_owner"), show_alert: true });
+      await recoverToClassesList(ctx, page, "error.not_owner");
       return;
     }
     await classRepository.softDelete(owned._id);
-    const { text, keyboard } = await renderMyClassesPage(String(ctx.user._id), Number(pageValue ?? "1"), lang);
+    const { text, keyboard } = await renderMyClassesPage(String(ctx.user._id), page, lang);
     await ctx.answerCallbackQuery({ text: t(lang, "myclasses.deleted"), show_alert: false });
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
+  });
+
+  bot.callbackQuery(new RegExp(`^${MYCLASSES_DELETE_CANCEL_PREFIX}`), async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+    const payload = ctx.callbackQuery.data.slice(MYCLASSES_DELETE_CANCEL_PREFIX.length);
+    const [classId, pageValue] = payload.split(":");
+    const page = Number(pageValue ?? "1");
+    const result = await renderClassView(classId ?? "", ctx.user._id, page, lang);
+    if (!result) {
+      await recoverToClassesList(ctx, page, "error.not_owner");
+      return;
+    }
+    ctx.session.activeClassId = classId;
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(ctx, result.text, { reply_markup: result.keyboard });
   });
 
   bot.callbackQuery(new RegExp(`^${MYCLASSES_ADD_TEST_PREFIX}`), async (ctx) => {
@@ -410,14 +510,14 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     }
     const classId = ctx.session.activeClassId;
     if (!classId) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: false });
+      await recoverToClassesList(ctx, 1, "error.session_not_found");
       return;
     }
     const payload = ctx.callbackQuery.data.slice(MYCLASSES_ADD_TEST_PREFIX.length);
     const [pageValue, backPageValue] = payload.split(":");
     const result = await renderAvailableTestsPage(classId, ctx.user._id, Number(pageValue ?? "1"), Number(backPageValue ?? "1"), lang);
     if (!result) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.not_owner"), show_alert: true });
+      await recoverToClassesList(ctx, Number(backPageValue ?? "1"), "error.not_owner");
       return;
     }
     await ctx.answerCallbackQuery();
@@ -432,14 +532,14 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     }
     const classId = ctx.session.activeClassId;
     if (!classId) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: false });
+      await recoverToClassesList(ctx, 1, "error.session_not_found");
       return;
     }
     const payload = ctx.callbackQuery.data.slice(MYCLASSES_ADD_TEST_PAGE_PREFIX.length);
     const [pageValue, backPageValue] = payload.split(":");
     const result = await renderAvailableTestsPage(classId, ctx.user._id, Number(pageValue ?? "1"), Number(backPageValue ?? "1"), lang);
     if (!result) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.not_owner"), show_alert: true });
+      await recoverToClassesList(ctx, Number(backPageValue ?? "1"), "error.not_owner");
       return;
     }
     await ctx.answerCallbackQuery();
@@ -454,7 +554,7 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     }
     const classId = ctx.session.activeClassId;
     if (!classId) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: false });
+      await recoverToClassesList(ctx, 1, "error.session_not_found");
       return;
     }
     const payload = ctx.callbackQuery.data.slice(MYCLASSES_ADD_PICK_PREFIX.length);
@@ -462,7 +562,7 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     const ownedClass = await classRepository.findByIdAndCreator(classId, ctx.user._id);
     const ownedTest = await testRepository.findByIdAndCreator(testId ?? "", ctx.user._id);
     if (!ownedClass || !ownedTest) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.not_owner"), show_alert: true });
+      await recoverToClassesList(ctx, Number(backPageValue ?? "1"), "error.not_owner");
       return;
     }
     await classRepository.addTest(ownedClass._id, ownedTest._id);
@@ -499,16 +599,16 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
     }
     const classId = ctx.session.activeClassId;
     if (!classId) {
-      await ctx.answerCallbackQuery({ text: t(lang, "error.session_not_found"), show_alert: false });
+      await recoverToClassesList(ctx, 1, "error.session_not_found");
       return;
     }
     const page = Number(ctx.callbackQuery.data.slice(MYCLASSES_SHARE_BACK_CLASS_PREFIX.length));
     const result = await renderClassView(classId, ctx.user._id, page, lang);
-    await ctx.answerCallbackQuery();
     if (!result) {
-      await ctx.reply(t(lang, "error.not_owner"));
+      await recoverToClassesList(ctx, page, "error.not_owner");
       return;
     }
+    await ctx.answerCallbackQuery();
     await safeEditMessage(ctx, result.text, { reply_markup: result.keyboard });
   });
 
@@ -527,6 +627,20 @@ export const registerClassesHandler = (bot: Bot<BotContext>): void => {
 
   bot.callbackQuery(MYCLASSES_NOOP_CB, async (ctx) => {
     await ctx.answerCallbackQuery();
+  });
+
+  bot.callbackQuery(MYCLASSES_NAME_CANCEL_CB, async (ctx) => {
+    const lang = ctx.lang();
+    if (!ctx.user) {
+      await ctx.answerCallbackQuery({ text: t(lang, "error.userSession"), show_alert: false });
+      return;
+    }
+    ctx.session.classEditorMode = undefined;
+    ctx.session.classEditingId = undefined;
+    ctx.session.activeClassId = undefined;
+    const { text, keyboard } = await renderMyClassesPage(String(ctx.user._id), 1, lang);
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   bot.on("message:text", async (ctx, next) => {

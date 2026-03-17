@@ -75,9 +75,9 @@ export class GroupSessionRepository {
     return GroupSessionModel.find({ status: "active" }).exec();
   }
 
-  async advance(sessionId: string | Types.ObjectId): Promise<GroupSessionDocument | null> {
-    return GroupSessionModel.findByIdAndUpdate(
-      sessionId,
+  async advance(sessionId: string | Types.ObjectId, expectedIndex: number): Promise<GroupSessionDocument | null> {
+    return GroupSessionModel.findOneAndUpdate(
+      { _id: sessionId, currentQuestionIndex: expectedIndex, status: "active" },
       { $inc: { currentQuestionIndex: 1 } },
       { new: true }
     ).exec();

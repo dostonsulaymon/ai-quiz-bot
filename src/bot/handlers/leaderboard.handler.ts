@@ -83,6 +83,7 @@ export const registerLeaderboardHandler = (bot: Bot<BotContext>): void => {
     const testId = ctx.callbackQuery.data.slice(LEADERBOARD_CALLBACK_PREFIX.length);
     const lang = ctx.lang();
     await ctx.answerCallbackQuery();
+    await ctx.replyWithChatAction("typing");
 
     const participantCount = await leaderboardRepository.getParticipantCount(testId);
     if (participantCount < 2) {

@@ -28,11 +28,12 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
   bot.catch(async (error: BotError<BotContext>) => {
     const lang = error.ctx.lang();
     const appError = toAppError(error.error);
+    const updateType = Object.keys(error.ctx.update).find(k => k !== "update_id") ?? "unknown";
     recordError();
     logger.error("Unhandled bot error", {
       code: appError.code,
       userId: error.ctx.from?.id,
-      updateType: Object.keys(error.ctx.update)[0] ?? "unknown",
+      updateType,
       stack: error.error instanceof Error ? error.error.stack : undefined,
       details: appError.details
     });
@@ -41,8 +42,8 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
       Sentry.captureException(error.error, {
         extra: {
           userId: error.ctx.from?.id,
-          updateType: Object.keys(error.ctx.update)[0] ?? "unknown",
-          sessionState: error.ctx.session?.state
+          updateType,
+          sessionState: (error.ctx.from && error.ctx.chat) ? error.ctx.session?.state : "N/A"
         }
       });
     }
@@ -59,9 +60,11 @@ export const registerErrorMiddleware = (bot: GrammyBot<BotContext>): void => {
           ? t(lang, "error.generic")
           : t(lang, appError.userMessage as any, appError.details as Record<string, string | number>);
 
-      await error.ctx.reply(message, {
-        reply_markup: keyboard
-      });
+      if (error.ctx.chatId) {
+        await error.ctx.reply(message, {
+          reply_markup: keyboard
+        });
+      }
     } catch (replyError) {
       logger.error("Failed to send error reply", {
         userId: error.ctx.from?.id,

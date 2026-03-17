@@ -17,24 +17,24 @@ import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.j
 import { TestSessionRepository } from "../../db/repositories/test-session.repository.js";
 import type { UserStats } from "../../db/repositories/test-session.repository.js";
 import { GroupSessionRepository } from "../../db/repositories/group-session.repository.js";
-import { userCache } from "../middlewares/userMiddleware.js";
 import { safeEditMessage } from "../utils/telegram.js";
 import { buildMainMenuKeyboard } from "../utils/keyboards.js";
+import { handleReportQuestion } from "./report.handler.js";
 
-const commands: BotCommand[] = [
-  { command: "start", description: "Start the bot and open a shared test" },
-  { command: "newtest", description: "Create a new test from text, PDF, or images" },
-  { command: "join", description: "Join a shared test using a share code" },
-  { command: "mytests", description: "List tests you created" },
-  { command: "myclasses", description: "Manage your classes of tests" },
-  { command: "history", description: "View your past test sessions" },
-  { command: "stats", description: "View your overall performance statistics" },
-  { command: "settings", description: "Configure your default test preferences" },
-  { command: "leaderboard", description: "View leaderboard for a test by share code" },
-  { command: "language", description: "Change language / Tilni o'zgartirish" },
-  { command: "stop", description: "Stop the current group quiz (group chats only)" },
-  { command: "cancel", description: "Cancel the current flow and reset progress" },
-  { command: "help", description: "Show available commands" }
+const getCommands = (lang: Language): BotCommand[] => [
+  { command: "start", description: t(lang, "command.start") },
+  { command: "newtest", description: t(lang, "command.newtest") },
+  { command: "join", description: t(lang, "command.join") },
+  { command: "mytests", description: t(lang, "command.mytests") },
+  { command: "myclasses", description: t(lang, "command.myclasses") },
+  { command: "history", description: t(lang, "command.history") },
+  { command: "stats", description: t(lang, "command.stats") },
+  { command: "settings", description: t(lang, "command.settings") },
+  { command: "leaderboard", description: t(lang, "command.leaderboard") },
+  { command: "language", description: t(lang, "command.language") },
+  { command: "stop", description: t(lang, "command.stop") },
+  { command: "cancel", description: t(lang, "command.cancel") },
+  { command: "help", description: t(lang, "command.help") }
 ];
 
 const JOIN_AWAITING_CODE = "__awaiting_join_code__";
@@ -73,6 +73,7 @@ const buildPreviewKeyboard = (testId: string, lang: ReturnType<BotContext["lang"
 
 const showTestPreview = async (ctx: BotContext, testId: string): Promise<void> => {
   const lang = ctx.lang();
+  await ctx.replyWithChatAction("typing");
   const test = await testRepository.findById(testId);
   if (!test || !test.isActive) {
     await ctx.reply(t(lang, "commands.testLinkInvalid"));
@@ -100,6 +101,7 @@ const showTestPreview = async (ctx: BotContext, testId: string): Promise<void> =
 };
 
 const previewSharedTest = async (ctx: BotContext, shareCode: string): Promise<void> => {
+  await ctx.replyWithChatAction("typing");
   const test = await testRepository.findByShareCode(shareCode);
   if (!test) {
     await ctx.reply(t(ctx.lang(), "commands.testLinkInvalid"));
@@ -134,6 +136,9 @@ const buildLanguageKeyboard = (lang: Language): InlineKeyboard =>
     .text(t(lang, "language.btn.en"), `${LANG_CALLBACK_PREFIX}en`)
     .text(t(lang, "language.btn.uz"), `${LANG_CALLBACK_PREFIX}uz`);
 
+const buildJoinPromptKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "join.cancel_btn"), JOIN_CANCEL_CALLBACK);
+
 const buildStatsEmptyKeyboard = (lang: Language): InlineKeyboard =>
   new InlineKeyboard()
     .text(t(lang, "deadend.btn.create_test"), NAV_NEWTEST_CALLBACK)
@@ -152,7 +157,9 @@ const handleJoinByCode = async (ctx: BotContext, raw: string): Promise<void> => 
   const shareCode = normalizeShareCode(raw);
   if (!isShareCode(shareCode)) {
     ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
-    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+    await ctx.reply(t(ctx.lang(), "commands.invalidCode"), {
+      reply_markup: buildJoinPromptKeyboard(ctx.lang())
+    });
     return;
   }
   ctx.session.pendingJoinCode = undefined;
@@ -160,7 +167,13 @@ const handleJoinByCode = async (ctx: BotContext, raw: string): Promise<void> => 
 };
 
 export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<void> => {
-  await bot.api.setMyCommands(commands);
+  // Register commands for all supported languages
+  await Promise.all([
+    bot.api.setMyCommands(getCommands("en"), { language_code: "en" }),
+    bot.api.setMyCommands(getCommands("uz"), { language_code: "uz" }),
+    // Default commands (fallback)
+    bot.api.setMyCommands(getCommands("en"))
+  ]);
 
   bot.command("start", async (ctx) => {
     const payload = (ctx.match as string | undefined) ?? ctx.message?.text?.split(" ")[1];
@@ -191,6 +204,11 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       const prompt = `${t("en", "language.auto_prompt")}\n${t("uz", "language.auto_prompt_uz")}`;
       await ctx.reply(prompt, { reply_markup: buildLanguageKeyboard(ctx.lang()) });
       return;
+    }
+
+    if (payload?.startsWith("report_")) {
+      const qId = payload.slice(7);
+      return handleReportQuestion(ctx, qId);
     }
 
     if (payload?.startsWith("TEST-")) {
@@ -287,12 +305,16 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     const chatType = ctx.chat?.type;
     if (chatType === "group" || chatType === "supergroup") {
       if (!raw) {
-        await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+        await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"), {
+          reply_markup: buildJoinPromptKeyboard(ctx.lang())
+        });
         return;
       }
       const shareCode = normalizeShareCode(raw);
       if (!isShareCode(shareCode)) {
-        await ctx.reply(t(ctx.lang(), "commands.invalidCode"));
+        await ctx.reply(t(ctx.lang(), "commands.invalidCode"), {
+          reply_markup: buildJoinPromptKeyboard(ctx.lang())
+        });
         return;
       }
       const test = await testRepository.findByShareCode(shareCode);
@@ -315,7 +337,9 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     if (!raw) {
       ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
-      await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+      await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"), {
+        reply_markup: buildJoinPromptKeyboard(ctx.lang())
+      });
       return;
     }
 
@@ -369,7 +393,8 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
             t(lang, "test.cancelled.score", { pct }),
             t(lang, "test.complete.separator"),
             t(lang, "test.cancelled.not_saved")
-          ].join("\n")
+          ].join("\n"),
+          { reply_markup: buildMainMenuKeyboard(lang) }
         );
         resetSession(ctx.session);
         return;
@@ -385,31 +410,31 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
         ? t(lang, "cancel.uploading", { count: fileCount })
         : t(lang, "cancel.uploading_empty");
       resetSession(ctx.session);
-      await ctx.reply(msg);
+      await ctx.reply(msg, { reply_markup: buildMainMenuKeyboard(lang) });
       return;
     }
 
     if (state === "configuring") {
       resetSession(ctx.session);
-      await ctx.reply(t(lang, "cancel.configuring"));
+      await ctx.reply(t(lang, "cancel.configuring"), { reply_markup: buildMainMenuKeyboard(lang) });
       return;
     }
 
     if (state === "reviewing") {
       const count = ctx.session.draftQuestions?.length ?? 0;
       resetSession(ctx.session);
-      await ctx.reply(t(lang, "cancel.reviewing", { count }));
+      await ctx.reply(t(lang, "cancel.reviewing", { count }), { reply_markup: buildMainMenuKeyboard(lang) });
       return;
     }
 
     if (state === "editing") {
       resetSession(ctx.session);
-      await ctx.reply(t(lang, "cancel.editing"));
+      await ctx.reply(t(lang, "cancel.editing"), { reply_markup: buildMainMenuKeyboard(lang) });
       return;
     }
 
     resetSession(ctx.session);
-    await ctx.reply(t(lang, "commands.cancelled"));
+    await ctx.reply(t(lang, "commands.cancelled"), { reply_markup: buildMainMenuKeyboard(lang) });
   });
 
   bot.command("stop", async (ctx) => {
@@ -437,15 +462,16 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
     await ctx.answerCallbackQuery();
 
     if (ctx.user) {
+      const cacheKey = `quiz-bot:cache:user:${ctx.from.id}`;
       await userRepository.updateSettings(ctx.user._id, { language: newLang, languagePrompted: true });
-      if (ctx.from) userCache.delete(ctx.from.id);
+      await ctx.redis.del(cacheKey);
     }
 
     ctx.session.language = newLang;
     ctx.lang = () => newLang;
 
     const confirmKey = newLang === "uz" ? "language.selected.uz" : "language.selected.en";
-    await ctx.reply(t(newLang, confirmKey));
+    await ctx.reply(t(newLang, confirmKey), { reply_markup: buildMainMenuKeyboard(newLang) });
 
     logger.info("Language changed", { event: "command.language.changed", userId: ctx.from?.id, lang: newLang });
 
@@ -479,7 +505,7 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
           createdCount
         });
       }
-      await ctx.reply(text, { reply_markup: buildMainMenuKeyboard(newLang) });
+      await ctx.reply(text);
     }
 
     if (ctx.session.settingsReturnToMenu && ctx.user) {
@@ -497,7 +523,9 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     const shareCode = normalizeShareCode(ctx.msg.text);
     if (!isShareCode(shareCode)) {
-      await ctx.reply(t(ctx.lang(), "commands.invalidCode"));
+      await ctx.reply(t(ctx.lang(), "commands.invalidCode"), {
+        reply_markup: buildJoinPromptKeyboard(ctx.lang())
+      });
       return;
     }
 
@@ -515,7 +543,7 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   bot.callbackQuery(JOIN_CANCEL_CALLBACK, async (ctx) => {
     await ctx.answerCallbackQuery();
     ctx.session.pendingJoinCode = undefined;
-    await ctx.reply(t(ctx.lang(), "commands.joinCancelled"), {
+    await ctx.reply(t(ctx.lang(), "join.cancelled"), {
       reply_markup: buildJoinCancelledKeyboard(ctx.lang())
     });
   });
@@ -551,7 +579,9 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
     const shareCode = normalizeShareCode(raw);
     if (!isShareCode(shareCode)) {
-      await ctx.reply(t(lang, "commands.invalidCode"));
+      await ctx.reply(t(lang, "commands.invalidCode"), {
+        reply_markup: buildJoinPromptKeyboard(lang)
+      });
       return;
     }
 
@@ -561,6 +591,7 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       return;
     }
 
+    await ctx.replyWithChatAction("typing");
     const { text } = await renderLeaderboard(String(test._id), ctx.user?._id ? String(ctx.user._id) : undefined, lang);
     await ctx.reply(text);
   });
@@ -571,6 +602,7 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
       await ctx.reply(t(lang, "error.userLoad"));
       return;
     }
+    await ctx.replyWithChatAction("typing");
     const [stats, testsCreated] = await Promise.all([
       testSessionRepository.getUserStats(ctx.user._id),
       testRepository.countByCreator(ctx.user._id)
@@ -597,7 +629,9 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
 
   bot.hears([t("en", "menu.join_test"), t("uz", "menu.join_test")], async (ctx) => {
     ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
-    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"), {
+      reply_markup: buildJoinPromptKeyboard(ctx.lang())
+    });
   });
 
   bot.hears([t("en", "menu.my_stats"), t("uz", "menu.my_stats")], async (ctx) => {
@@ -650,7 +684,9 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   bot.callbackQuery(NAV_JOIN_CALLBACK, async (ctx) => {
     ctx.session.pendingJoinCode = JOIN_AWAITING_CODE;
     await ctx.answerCallbackQuery();
-    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"));
+    await ctx.reply(t(ctx.lang(), "commands.joinPromptCode"), {
+      reply_markup: buildJoinPromptKeyboard(ctx.lang())
+    });
   });
 
   bot.callbackQuery(NAV_MYTESTS_CALLBACK, async (ctx) => {

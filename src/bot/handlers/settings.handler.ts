@@ -4,7 +4,6 @@ import type { BotContext } from "../types.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import type { QuestionType } from "../../shared/types/index.js";
 import { safeEditMessage } from "../utils/telegram.js";
-import { userCache } from "../middlewares/userMiddleware.js";
 import type { UserDocument } from "../../db/models/user.model.js";
 
 // ---------------------------------------------------------------------------
@@ -15,6 +14,7 @@ export const SETTINGS_MENU_CB = "settings:menu";
 const SETTINGS_COUNT_CB = "settings:count";
 const SETTINGS_COUNT_PREFIX = "settings:count:";
 const SETTINGS_COUNT_CUSTOM_CB = "settings:count:custom";
+const SETTINGS_COUNT_CANCEL_CB = "settings:count:cancel";
 const SETTINGS_TYPES_CB = "settings:types";
 const SETTINGS_TYPES_TOGGLE_PREFIX = "settings:types:toggle:";
 const SETTINGS_TYPES_CONFIRM_CB = "settings:types:confirm";
@@ -90,6 +90,9 @@ const buildCountKeyboard = (lang: Language): InlineKeyboard =>
     .row()
     .text(t(lang, "upload.btn.custom"), SETTINGS_COUNT_CUSTOM_CB)
     .text(t(lang, "btn.back"), SETTINGS_MENU_CB);
+
+const buildCustomCountCancelKeyboard = (lang: Language): InlineKeyboard =>
+  new InlineKeyboard().text(t(lang, "settings.cancel_btn"), SETTINGS_COUNT_CANCEL_CB);
 
 const buildTypesKeyboard = (selectedTypes: QuestionType[], lang: Language): InlineKeyboard => {
   const selected = new Set(selectedTypes);
@@ -179,7 +182,7 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     const count = parseInt(ctx.callbackQuery.data.slice(SETTINGS_COUNT_PREFIX.length), 10);
     await userRepository.updatePreferences(ctx.user._id, { defaultQuestionCount: count });
     ctx.user.defaultQuestionCount = count;
-    if (ctx.from) userCache.delete(ctx.from.id);
+    if (ctx.from) await ctx.redis.del(`quiz-bot:cache:user:${ctx.from.id}`);
     await ctx.answerCallbackQuery({ text: t(lang, "settings.saved_count", { count }), show_alert: false });
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
@@ -189,7 +192,17 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     if (!ctx.user) { await ctx.answerCallbackQuery(); return; }
     ctx.session.settingsAwaitingCustomCount = true;
     await ctx.answerCallbackQuery();
-    await ctx.reply(t(ctx.lang(), "upload.customCountPrompt"));
+    await ctx.reply(t(ctx.lang(), "upload.customCountPrompt"), {
+      reply_markup: buildCustomCountCancelKeyboard(ctx.lang())
+    });
+  });
+
+  bot.callbackQuery(SETTINGS_COUNT_CANCEL_CB, async (ctx) => {
+    if (!ctx.user) { await ctx.answerCallbackQuery(); return; }
+    ctx.session.settingsAwaitingCustomCount = undefined;
+    const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), ctx.lang());
+    await ctx.answerCallbackQuery();
+    await safeEditMessage(ctx, text, { reply_markup: keyboard });
   });
 
   // ── Types ────────────────────────────────────────────────────────────────
@@ -227,7 +240,7 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     }
     await userRepository.updatePreferences(ctx.user._id, { defaultQuestionTypes: types });
     ctx.user.defaultQuestionTypes = types;
-    if (ctx.from) userCache.delete(ctx.from.id);
+    if (ctx.from) await ctx.redis.del(`quiz-bot:cache:user:${ctx.from.id}`);
     ctx.session.settingsDraftTypes = undefined;
     await ctx.answerCallbackQuery({ text: t(lang, "settings.saved_types"), show_alert: false });
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
@@ -250,7 +263,7 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     const seconds = parseInt(ctx.callbackQuery.data.slice(SETTINGS_TIMER_PREFIX.length), 10);
     await userRepository.updatePreferences(ctx.user._id, { defaultTimeLimitSeconds: seconds });
     ctx.user.defaultTimeLimitSeconds = seconds;
-    if (ctx.from) userCache.delete(ctx.from.id);
+    if (ctx.from) await ctx.redis.del(`quiz-bot:cache:user:${ctx.from.id}`);
     await ctx.answerCallbackQuery({ text: t(lang, "settings.saved_timer"), show_alert: false });
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
@@ -278,7 +291,7 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     });
     ctx.user.defaultShuffleQuestions = shuffleQ;
     ctx.user.defaultShuffleOptions = shuffleO;
-    if (ctx.from) userCache.delete(ctx.from.id);
+    if (ctx.from) await ctx.redis.del(`quiz-bot:cache:user:${ctx.from.id}`);
     await ctx.answerCallbackQuery({ text: t(lang, "settings.saved_shuffle"), show_alert: false });
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), lang);
     await safeEditMessage(ctx, text, { reply_markup: keyboard });
@@ -332,7 +345,7 @@ export const registerSettingsHandler = (bot: Bot<BotContext>): void => {
     ctx.session.settingsAwaitingCustomCount = undefined;
     await userRepository.updatePreferences(ctx.user._id, { defaultQuestionCount: count });
     ctx.user.defaultQuestionCount = count;
-    if (ctx.from) userCache.delete(ctx.from.id);
+    if (ctx.from) await ctx.redis.del(`quiz-bot:cache:user:${ctx.from.id}`);
 
     const { text, keyboard } = await buildSettingsPage(String(ctx.user._id), ctx.lang());
     await ctx.reply(text, { reply_markup: keyboard });

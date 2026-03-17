@@ -6,7 +6,7 @@ import type { Language } from "../shared/i18n/index.js";
 
 export type BotSessionState = "idle" | "uploading" | "configuring" | "reviewing" | "testing" | "done" | "editing";
 
-export type UploadStep = "waiting_file" | "waiting_text" | "waiting_count" | "waiting_count_custom" | "waiting_types" | "waiting_shuffle" | "waiting_timer" | "waiting_title" | "waiting_retry" | "waiting_action";
+export type UploadStep = "waiting_file" | "waiting_text" | "waiting_preset" | "waiting_count" | "waiting_count_custom" | "waiting_types" | "waiting_shuffle" | "waiting_timer" | "waiting_title" | "waiting_retry" | "waiting_action";
 
 export type ReviewSubState = "idle" | "editing_answer";
 
@@ -66,6 +66,7 @@ export type BotSession = {
   pendingJoinCode?: string;
   uploadedText?: string;
   settingsDraftTypes?: QuestionType[];
+  uploadAutoStart?: boolean;
   // Upload sub-state
   uploadStep?: UploadStep;
   uploadTypesMessageId?: number;
@@ -123,6 +124,7 @@ export const createInitialSession = (): BotSession => ({
   uploadedFiles: undefined,
   uploadedText: undefined,
   settingsDraftTypes: undefined,
+  uploadAutoStart: undefined,
   uploadSourceType: undefined,
   shuffleQuestions: undefined,
   shuffleOptions: undefined,

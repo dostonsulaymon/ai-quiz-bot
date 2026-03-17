@@ -62,7 +62,7 @@ export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
 
   // Session recovery reply now runs after userMiddleware so it can use ctx.lang().
   bot.use(async (ctx, next) => {
-    if (ctx.session.sessionRecovered) {
+    if (ctx.from && ctx.chat && ctx.session.sessionRecovered) {
       ctx.session.sessionRecovered = false;
       await ctx.reply(t(ctx.lang(), "error.generic"));
     }
@@ -74,7 +74,7 @@ export const createBot = async (redis: Redis): Promise<Bot<BotContext>> => {
     logger.info("update received", {
       updateType: Object.keys(ctx.update).find((k) => k !== "update_id") ?? "unknown",
       callbackData: ctx.callbackQuery?.data ?? null,
-      sessionState: ctx.session.state,
+      sessionState: (ctx.from && ctx.chat) ? ctx.session.state : "N/A",
       chatId: ctx.chat?.id,
       lang: ctx.lang()
     });
