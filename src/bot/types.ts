@@ -38,6 +38,8 @@ export type UploadedFile = {
   fileId: string;
   /** Redis key where the base64 content is stored (short-lived, TTL 1 hour). */
   storageKey: string;
+  /** Original file size in bytes when Telegram provided it. */
+  fileSizeBytes?: number;
   /** Actual MIME type of the image (e.g. "image/jpeg", "image/png"). Absent for PDFs. */
   mimeType?: string;
 };
@@ -69,6 +71,7 @@ export type BotSession = {
   uploadAutoStart?: boolean;
   // Upload sub-state
   uploadStep?: UploadStep;
+  uploadCustomCountAttempts?: number;
   uploadTypesMessageId?: number;
   // Review sub-state
   reviewMessageId?: number;
@@ -138,6 +141,7 @@ export const createInitialSession = (): BotSession => ({
   activeTestSlotId: undefined,
   pendingJoinCode: undefined,
   uploadStep: undefined,
+  uploadCustomCountAttempts: undefined,
   uploadTypesMessageId: undefined,
   reviewMessageId: undefined,
   reviewSubState: undefined,

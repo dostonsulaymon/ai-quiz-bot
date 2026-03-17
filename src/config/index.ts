@@ -30,6 +30,7 @@ type Config = {
   SESSION_TTL_SECONDS: number;
   STALE_GROUP_SESSION_TTL_MS: number;
   ABANDONED_SESSION_TTL_MS: number;
+  SUPER_ADMIN_ID?: number;
 };
 
 const PROVIDERS = ["claude", "gemini", "ollama"] as const;
@@ -96,8 +97,9 @@ export const config: Config = {
   MAX_FILE_SIZE_MB: parseNumber("MAX_FILE_SIZE_MB"),
   RATE_LIMIT_GENERATIONS_PER_HOUR: parseNumber("RATE_LIMIT_GENERATIONS_PER_HOUR"),
   RATE_LIMIT_DAILY_MAX: parseNumber("RATE_LIMIT_DAILY_MAX"),
-  AI_TIMEOUT_MS: Number(process.env.AI_TIMEOUT_MS) || 60_000,
+  AI_TIMEOUT_MS: Number(process.env.AI_TIMEOUT_MS) || 120_000,
   SESSION_TTL_SECONDS: Number(process.env.SESSION_TTL_SECONDS) || 604_800,
   STALE_GROUP_SESSION_TTL_MS: Number(process.env.STALE_GROUP_SESSION_TTL_MS) || 1_800_000,
-  ABANDONED_SESSION_TTL_MS: Number(process.env.ABANDONED_SESSION_TTL_MS) || 86_400_000
+  ABANDONED_SESSION_TTL_MS: Number(process.env.ABANDONED_SESSION_TTL_MS) || 86_400_000,
+  SUPER_ADMIN_ID: process.env.SUPER_ADMIN_ID ? Number(process.env.SUPER_ADMIN_ID) : undefined
 };

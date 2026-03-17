@@ -44,6 +44,10 @@ const incrementWithTtl = async (
 export const assertGenerationRateLimit = async (ctx: BotContext): Promise<void> => {
   const userId = getUserId(ctx);
 
+  if (config.SUPER_ADMIN_ID && userId === config.SUPER_ADMIN_ID) {
+    return;
+  }
+
   const dailyKey = `quiz-bot:ratelimit:daily-api:${userId}`;
   const daily = await incrementWithTtl(ctx, dailyKey, DAILY_TTL_SECONDS);
 
@@ -71,6 +75,10 @@ export const assertGenerationRateLimit = async (ctx: BotContext): Promise<void> 
 
 export const acquireActiveTestSessionSlot = async (ctx: BotContext): Promise<void> => {
   const userId = getUserId(ctx);
+
+  if (config.SUPER_ADMIN_ID && userId === config.SUPER_ADMIN_ID) {
+    return;
+  }
 
   if (ctx.session.activeTestSlotId) {
     await ctx.redis.expire(`quiz-bot:ratelimit:active-tests:${userId}`, ACTIVE_SESSION_TTL_SECONDS);

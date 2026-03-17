@@ -14,8 +14,7 @@ const classSchema = new Schema(
     creatorId: {
       type: Schema.Types.ObjectId,
       ref: "User",
-      required: true,
-      index: true
+      required: true
     },
     testIds: {
       type: [Schema.Types.ObjectId],
@@ -36,8 +35,6 @@ const classSchema = new Schema(
   { timestamps: true }
 );
 
-classSchema.index({ creatorId: 1 });
-classSchema.index({ shareCode: 1 }, { unique: true, sparse: true });
 
 export type Class = InferSchemaType<typeof classSchema> & {
   _id: Types.ObjectId;

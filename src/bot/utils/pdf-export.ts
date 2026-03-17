@@ -1,15 +1,86 @@
 import PDFDocument from "pdfkit";
-import { readFileSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import ArabicReshaper from "arabic-reshaper";
+import bidiFactory from "bidi-js";
 import type { TestDocument } from "../../db/models/test.model.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 
+const bidi = bidiFactory();
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const NOTO_SANS_PATH = path.resolve(__dirname, "../../assets/fonts/NotoSans-Regular.ttf");
 
-const hasNonLatin = (text: string): boolean => /[^\x00-\x7F]/.test(text);
+const NOTO_ARABIC_PATH = path.resolve(__dirname, "../../assets/fonts/NotoSansArabic-Regular.ttf");
+const NOTO_LATIN_PATH = path.resolve(__dirname, "../../assets/fonts/NotoSans-Regular.ttf");
+
+const hasArabic = (text: string): boolean => /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(text);
+
+/**
+ * Reshapes Arabic text and applies the Unicode Bidirectional Algorithm
+ * for proper display in PDFKit.
+ */
+const fixArabicText = (text: string): string => {
+  if (!text || !hasArabic(text)) return text;
+  try {
+    const reshaped = ArabicReshaper.convertArabic(text);
+    return bidi.getReorderedString(reshaped, bidi.getEmbeddingLevels(reshaped));
+  } catch (e) {
+    return text;
+  }
+};
+
+/**
+ * Segments text into Arabic and non-Arabic chunks for font switching.
+ */
+const segmentText = (text: string): { text: string; isArabic: boolean }[] => {
+  const arabicRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g;
+  const segments: { text: string; isArabic: boolean }[] = [];
+  let lastIndex = 0;
+  let match;
+
+  while ((match = arabicRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ text: text.slice(lastIndex, match.index), isArabic: false });
+    }
+    segments.push({ text: match[0], isArabic: true });
+    lastIndex = arabicRegex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    segments.push({ text: text.slice(lastIndex), isArabic: false });
+  }
+
+  return segments || [{ text, isArabic: false }];
+};
+
+/**
+ * Helper to draw text using the appropriate font for each character.
+ */
+const drawMixedText = (
+  doc: PDFKit.PDFDocument,
+  text: string,
+  options: any = {},
+  isBold: boolean = false
+) => {
+  const segments = segmentText(text);
+  
+  segments.forEach((seg, i) => {
+    const isLast = i === segments.length - 1;
+    const fontName = seg.isArabic ? "ArabicFont" : "LatinFont";
+    
+    // PDFKit font switching
+    doc.font(fontName);
+    
+    const processedText = seg.isArabic ? fixArabicText(seg.text) : seg.text;
+    
+    doc.text(processedText, {
+      ...options,
+      continued: !isLast
+    });
+  });
+};
 
 const collectTextForFontCheck = (test: TestDocument, includeAnswers: boolean): string[] => {
   const values: string[] = [test.title ?? ""];
@@ -27,9 +98,6 @@ const collectTextForFontCheck = (test: TestDocument, includeAnswers: boolean): s
   return values;
 };
 
-const applyBodyFont = (doc: PDFKit.PDFDocument, fontName: string, size: number): PDFKit.PDFDocument =>
-  doc.font(fontName).fontSize(size).fillColor("black");
-
 export async function generateTestPDF(
   test: TestDocument,
   lang: Language,
@@ -43,44 +111,56 @@ export async function generateTestPDF(
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    const shouldUseUnicodeFont = collectTextForFontCheck(test, includeAnswers).some(hasNonLatin);
-    const bodyFont = shouldUseUnicodeFont ? "NotoSans" : "Helvetica";
-    const boldFont = shouldUseUnicodeFont ? "NotoSans" : "Helvetica-Bold";
-    const italicFont = shouldUseUnicodeFont ? "NotoSans" : "Helvetica-Oblique";
-
-    if (shouldUseUnicodeFont) {
-      readFileSync(NOTO_SANS_PATH);
-      doc.registerFont("NotoSans", NOTO_SANS_PATH);
+    // Register both fonts
+    if (existsSync(NOTO_LATIN_PATH)) {
+      doc.registerFont("LatinFont", NOTO_LATIN_PATH);
+    } else {
+      doc.registerFont("LatinFont", "Helvetica"); // Fallback
     }
 
-    applyBodyFont(doc, boldFont, 20).text(test.title?.trim() || t(lang, "common.untitledTest"), { align: "center" });
+    if (existsSync(NOTO_ARABIC_PATH)) {
+      doc.registerFont("ArabicFont", NOTO_ARABIC_PATH);
+    } else {
+      doc.registerFont("ArabicFont", "Helvetica"); // Fallback
+    }
+
+    // Title
+    const titleText = test.title?.trim() || t(lang, "common.untitledTest");
+    doc.fontSize(20).fillColor("black");
+    drawMixedText(doc, titleText, { align: "center" }, true);
     doc.moveDown();
 
-    applyBodyFont(doc, bodyFont, 10).text(
-      `${t(lang, "mytests.preview.questions", { n: test.questions.length })} • ${formatQuestionTypes(test.questions.map((question) => question.type), lang)}`,
-      { align: "center" }
-    );
+    // Subtitle
+    const subtitle = `${t(lang, "mytests.preview.questions", { n: test.questions.length })} • ${formatQuestionTypes(test.questions.map((q) => q.type), lang)}`;
+    doc.fontSize(10).fillColor("black");
+    drawMixedText(doc, subtitle, { align: "center" });
     doc.moveDown(2);
 
     test.questions.forEach((question, index) => {
-      applyBodyFont(doc, boldFont, 12).text(`${index + 1}. ${question.question}`);
+      doc.fontSize(12).fillColor("black");
+      drawMixedText(doc, `${index + 1}. ${question.question}`);
       doc.moveDown(0.5);
 
       if (question.type === "mcq" && question.options) {
         (["A", "B", "C", "D"] as const).forEach((letter) => {
           const option = question.options?.[letter];
           if (option) {
-            applyBodyFont(doc, bodyFont, 11).text(`   ${letter}) ${option}`);
+            doc.fontSize(11).fillColor("black");
+            drawMixedText(doc, `   ${letter}) ${option}`);
           }
         });
       } else if (question.type === "truefalse") {
-        applyBodyFont(doc, bodyFont, 11).text("   A) True    B) False");
+        doc.fontSize(11).fillColor("black");
+        drawMixedText(doc, "   A) True    B) False");
       } else {
-        applyBodyFont(doc, bodyFont, 11).text(`   ${t(lang, "mytests.export.answerLine")}`);
+        doc.fontSize(11).fillColor("black");
+        drawMixedText(doc, `   ${t(lang, "mytests.export.answerLine")}`);
       }
 
       if (includeAnswers) {
-        doc.font(italicFont).fontSize(10).fillColor("green").text(`   ✓ ${question.correctAnswer}`).fillColor("black");
+        doc.fontSize(10).fillColor("green");
+        drawMixedText(doc, `   ✓ ${question.correctAnswer}`);
+        doc.fillColor("black");
       }
 
       doc.moveDown();

@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx  src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -21,7 +21,9 @@
   "license": "ISC",
   "dependencies": {
     "@sentry/node": "^10.43.0",
+    "arabic-reshaper": "^1.1.0",
     "axios": "^1.9.0",
+    "bidi-js": "^1.0.3",
     "dotenv": "^16.4.7",
     "grammy": "^1.36.3",
     "ioredis": "^5.6.1",

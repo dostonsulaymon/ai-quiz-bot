@@ -47,7 +47,6 @@ const testSchema = new Schema(
       type: String,
       required: false,
       unique: true,
-      index: true,
       sparse: true,
       uppercase: true,
       minlength: 6,
@@ -57,8 +56,7 @@ const testSchema = new Schema(
     creatorId: {
       type: Schema.Types.ObjectId,
       ref: "User",
-      required: true,
-      index: true  // needed for findByCreator / countByCreator queries
+      required: true
     },
     title: {
       type: String,

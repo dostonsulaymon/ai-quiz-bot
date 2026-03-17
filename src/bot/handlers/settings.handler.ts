@@ -3,6 +3,7 @@ import { UserRepository } from "../../db/repositories/user.repository.js";
 import type { BotContext } from "../types.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import type { QuestionType } from "../../shared/types/index.js";
+import { config } from "../../config/index.js";
 import { safeEditMessage } from "../utils/telegram.js";
 import type { UserDocument } from "../../db/models/user.model.js";
 
@@ -26,7 +27,7 @@ const SETTINGS_LANGUAGE_CB = "settings:language";
 const SETTINGS_DONE_CB = "settings:done";
 
 const userRepository = new UserRepository();
-const CUSTOM_COUNT_MAX = 50;
+const CUSTOM_COUNT_MAX = config.MAX_QUESTIONS_PER_TEST;
 
 // ---------------------------------------------------------------------------
 // Display helpers

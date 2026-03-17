@@ -37,13 +37,29 @@ const ACTION_CALLBACK_PREFIX = "upload:action:";
 const SAVE_START_CALLBACK_PREFIX = "upload:save:start:";
 const UPLOAD_NAV_CALLBACK_PREFIX = "upload:nav:";
 const MAX_IMAGES = 10;
-const MAX_CUSTOM_QUESTION_COUNT = 50;
+const MAX_CUSTOM_QUESTION_COUNT = config.MAX_QUESTIONS_PER_TEST;
 const DEFAULT_MAX_FILE_SIZE_MB = 20;
 const FILE_DOWNLOAD_TIMEOUT_MS = 30_000;
 const RATE_LIMIT_RETRY_DELAY_SECONDS = 30;
 const SESSION_KEY_PREFIX = "quiz-bot:session:";
+const KB = 1024;
+const MB = 1024 * 1024;
 
 const getFileSizeLimitBytes = (): number => (config.MAX_FILE_SIZE_MB ?? DEFAULT_MAX_FILE_SIZE_MB) * 1024 * 1024;
+
+const getRecommendedQuestionCount = (uploadedFiles: UploadedFile[] | undefined): number | undefined => {
+  const first = uploadedFiles?.[0];
+  if (!first || first.type !== "pdf" || typeof first.fileSizeBytes !== "number") {
+    return undefined;
+  }
+
+  const size = first.fileSizeBytes;
+  if (size < 100 * KB) return 10;
+  if (size < 300 * KB) return 20;
+  if (size < 600 * KB) return 30;
+  if (size <= MB) return 50;
+  return Math.min(75, MAX_CUSTOM_QUESTION_COUNT);
+};
 
 const formatTimerLabel = (seconds: number, lang: Language): string => {
   switch (seconds) {
@@ -70,8 +86,21 @@ const formatShuffleLabel = (choice: "both" | "questions" | "none", lang: Languag
   }
 };
 
-const buildQuestionCountKeyboard = (lang: Language, defaultCount?: number): InlineKeyboard => {
+const buildQuestionCountKeyboard = (
+  lang: Language,
+  defaultCount?: number,
+  recommendedCount?: number
+): InlineKeyboard => {
   const keyboard = new InlineKeyboard();
+
+  if (recommendedCount !== undefined) {
+    keyboard
+      .text(
+        t(lang, "upload.recommendedCountButton", { count: recommendedCount }),
+        `${QUESTION_COUNT_CALLBACK_PREFIX}${recommendedCount}`
+      )
+      .row();
+  }
 
   if (defaultCount !== undefined) {
     keyboard
@@ -85,7 +114,10 @@ const buildQuestionCountKeyboard = (lang: Language, defaultCount?: number): Inli
     .text("15", `${QUESTION_COUNT_CALLBACK_PREFIX}15`)
     .text("20", `${QUESTION_COUNT_CALLBACK_PREFIX}20`)
     .row()
-    .text(t(lang, "upload.btn.custom"), `${QUESTION_COUNT_CALLBACK_PREFIX}custom`)
+    .text("30", `${QUESTION_COUNT_CALLBACK_PREFIX}30`)
+    .text("50", `${QUESTION_COUNT_CALLBACK_PREFIX}50`)
+    .row()
+    .text(t(lang, "upload.btn.customWithPencil"), `${QUESTION_COUNT_CALLBACK_PREFIX}custom`)
     .row()
     .text(t(lang, "btn.back"), `${UPLOAD_NAV_CALLBACK_PREFIX}preset`)
     .text(t(lang, "btn.cancel"), `${UPLOAD_NAV_CALLBACK_PREFIX}cancel`);
@@ -542,7 +574,12 @@ const handlePdfUpload = async (ctx: BotContext): Promise<void> => {
     const buffer = await getTelegramFileBuffer(ctx, document.file_id);
     const base64 = buffer.toString("base64");
     const storageKey = await storeUploadData(ctx.redis, ctx.from!.id, document.file_id, base64);
-    ctx.session.uploadedFiles = [{ type: "pdf", fileId: document.file_id, storageKey }];
+    ctx.session.uploadedFiles = [{
+      type: "pdf",
+      fileId: document.file_id,
+      storageKey,
+      fileSizeBytes: document.file_size
+    }];
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
       await ctx.reply(t(lang, "error.file_download_timeout"));
@@ -585,7 +622,13 @@ const handleFirstImage = async (ctx: BotContext): Promise<void> => {
     const buffer = await getTelegramFileBuffer(ctx, imageInfo.fileId);
     const base64 = buffer.toString("base64");
     const storageKey = await storeUploadData(ctx.redis, ctx.from!.id, imageInfo.fileId, base64);
-    ctx.session.uploadedFiles = [{ type: "image", fileId: imageInfo.fileId, storageKey, mimeType: imageInfo.mimeType }];
+    ctx.session.uploadedFiles = [{
+      type: "image",
+      fileId: imageInfo.fileId,
+      storageKey,
+      mimeType: imageInfo.mimeType,
+      fileSizeBytes: imageInfo.fileSize
+    }];
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
       await ctx.reply(t(lang, "error.file_download_timeout"));
@@ -661,7 +704,13 @@ const handleAdditionalImage = async (ctx: BotContext): Promise<void> => {
     const buffer = await getTelegramFileBuffer(ctx, imageInfo.fileId);
     const base64 = buffer.toString("base64");
     const storageKey = await storeUploadData(ctx.redis, ctx.from!.id, imageInfo.fileId, base64);
-    files.push({ type: "image", fileId: imageInfo.fileId, storageKey, mimeType: imageInfo.mimeType });
+    files.push({
+      type: "image",
+      fileId: imageInfo.fileId,
+      storageKey,
+      mimeType: imageInfo.mimeType,
+      fileSizeBytes: imageInfo.fileSize
+    });
     ctx.session.uploadedFiles = files;
   } catch (error) {
     if (error instanceof AppError && error.code === "FILE_DOWNLOAD_TIMEOUT") {
@@ -708,10 +757,19 @@ const transitionToPresetChoice = async (ctx: BotContext): Promise<void> => {
 };
 
 const transitionToWaitingCount = async (ctx: BotContext): Promise<void> => {
+  const lang = ctx.lang();
+  const recommendedCount = getRecommendedQuestionCount(ctx.session.uploadedFiles);
+
   transitionTo(ctx.session, "configuring", "transitionToWaitingCount");
   ctx.session.uploadStep = "waiting_count";
-  await ctx.reply(t(ctx.lang(), "upload.howManyQuestions"), {
-    reply_markup: buildQuestionCountKeyboard(ctx.lang(), ctx.user?.defaultQuestionCount)
+  ctx.session.uploadCustomCountAttempts = undefined;
+
+  const text = recommendedCount !== undefined
+    ? `${t(lang, "upload.howManyQuestions")}\n${t(lang, "upload.recommendedCountHint", { count: recommendedCount })}`
+    : t(lang, "upload.howManyQuestions");
+
+  await ctx.reply(text, {
+    reply_markup: buildQuestionCountKeyboard(lang, ctx.user?.defaultQuestionCount, recommendedCount)
   });
 };
 
@@ -832,17 +890,26 @@ const handleWaitingCount = async (ctx: BotContext): Promise<void> => {
   const value = data.slice(QUESTION_COUNT_CALLBACK_PREFIX.length);
 
   if (value === "custom") {
-    ctx.session.uploadStep = "waiting_count_custom";
-    await ctx.reply(t(ctx.lang(), "upload.customCountPrompt"), {
-      reply_markup: buildCountCustomKeyboard(ctx.lang())
-    });
+    await handleCustomCountCallback(ctx);
     return;
   }
 
   const count = Number(value);
+  if (!Number.isInteger(count) || count < 1 || count > MAX_CUSTOM_QUESTION_COUNT) {
+    await ctx.reply(t(ctx.lang(), "upload.useCountButtons"));
+    return;
+  }
   logger.info("Question count selected", { event: "upload.config.questionCount", userId: ctx.from?.id, count });
   ctx.session.questionCount = count;
   await transitionToWaitingTypes(ctx);
+};
+
+const handleCustomCountCallback = async (ctx: BotContext): Promise<void> => {
+  ctx.session.uploadStep = "waiting_count_custom";
+  ctx.session.uploadCustomCountAttempts = 0;
+  await ctx.reply(t(ctx.lang(), "upload.customCountPrompt"), {
+    reply_markup: buildCountCustomKeyboard(ctx.lang())
+  });
 };
 
 // ---------------------------------------------------------------------------
@@ -858,19 +925,33 @@ const handleWaitingCountCustom = async (ctx: BotContext): Promise<void> => {
   const rawValue = ctx.msg?.text?.trim();
 
   if (!rawValue) {
-    if (ctx.callbackQuery) await ctx.answerCallbackQuery();
-    await ctx.reply(t(ctx.lang(), "upload.typeNumberHint"));
+    const attempts = (ctx.session.uploadCustomCountAttempts ?? 0) + 1;
+    ctx.session.uploadCustomCountAttempts = attempts;
+    if (attempts < 2) {
+      await ctx.reply(t(ctx.lang(), "upload.typeNumberHint"));
+      return;
+    }
+    await ctx.reply(t(ctx.lang(), "upload.customCountFallbackToButtons"));
+    await transitionToWaitingCount(ctx);
     return;
   }
 
   const parsed = Number(rawValue);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_CUSTOM_QUESTION_COUNT) {
-    await ctx.reply(t(ctx.lang(), "upload.invalidCount"));
+    const attempts = (ctx.session.uploadCustomCountAttempts ?? 0) + 1;
+    ctx.session.uploadCustomCountAttempts = attempts;
+    if (attempts < 2) {
+      await ctx.reply(t(ctx.lang(), "upload.invalidCount"));
+      return;
+    }
+    await ctx.reply(t(ctx.lang(), "upload.customCountFallbackToButtons"));
+    await transitionToWaitingCount(ctx);
     return;
   }
 
   logger.info("Question count selected", { event: "upload.config.questionCount", userId: ctx.from?.id, count: parsed });
   ctx.session.questionCount = parsed;
+  ctx.session.uploadCustomCountAttempts = undefined;
   await transitionToWaitingTypes(ctx);
 };
 
@@ -1095,9 +1176,19 @@ const runGeneration = async (
 
   try {
     await assertGenerationRateLimit(ctx);
-    const questions = await generateWithFallback(input, async () => {
+    const generatedQuestions = await generateWithFallback(input, async () => {
       await ctx.reply(t(lang, "upload.ai_fallback"));
     });
+    const questions = generatedQuestions.slice(0, questionCount);
+
+    if (questions.length < questionCount) {
+      logger.warn("AI generation returned fewer questions than requested", {
+        event: "ai.generation.partial",
+        userId: ctx.from?.id,
+        requested: questionCount,
+        received: questions.length
+      });
+    }
 
     logger.info("AI generation succeeded", {
       event: "ai.generation.success",
