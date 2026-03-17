@@ -77,6 +77,8 @@ export type BotSession = {
   testQuestions?: Question[];
   testCorrectCount?: number;
   testQuestionMessageId?: number;
+  testProgressMessageId?: number;
+  testPollId?: string;
   testSubState?: TestSubState;
   testSelfGradePromptMessageId?: number;
   testPendingTextAnswer?: string;
@@ -141,6 +143,8 @@ export const createInitialSession = (): BotSession => ({
   testQuestions: undefined,
   testCorrectCount: undefined,
   testQuestionMessageId: undefined,
+  testProgressMessageId: undefined,
+  testPollId: undefined,
   testSubState: undefined,
   testSelfGradePromptMessageId: undefined,
   testPendingTextAnswer: undefined,
@@ -163,3 +167,12 @@ export const resetSession = (session: BotSession): BotSession => {
   Object.assign(session, createInitialSession());
   return session;
 };
+
+export type ActivePollSession = {
+  mode: "private" | "group";
+  sessionId: string;
+  chatId: string;
+  questionIndex: number;
+};
+
+export const activePollSessions = new Map<string, ActivePollSession>();

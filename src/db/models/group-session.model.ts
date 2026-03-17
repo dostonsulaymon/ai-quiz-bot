@@ -22,6 +22,7 @@ const groupSessionSchema = new Schema(
     status: { type: String, enum: ["active", "completed"], default: "active" },
     answers: { type: [groupAnswerSchema], default: [] },
     questionMessageId: { type: Number },
+    progressMessageId: { type: Number },
     questionSentAt: { type: Date },
     startedAt: { type: Date, default: Date.now }
   },

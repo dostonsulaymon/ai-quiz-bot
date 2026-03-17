@@ -59,6 +59,10 @@ export class GroupSessionRepository {
     await GroupSessionModel.updateOne({ _id: sessionId }, { $set: { questionMessageId: messageId } }).exec();
   }
 
+  async setProgressMessageId(sessionId: string | Types.ObjectId, messageId: number | null): Promise<void> {
+    await GroupSessionModel.updateOne({ _id: sessionId }, { $set: { progressMessageId: messageId } }).exec();
+  }
+
   async setQuestionSentAt(sessionId: string | Types.ObjectId, sentAt: Date): Promise<void> {
     await GroupSessionModel.updateOne({ _id: sessionId }, { $set: { questionSentAt: sentAt } }).exec();
   }

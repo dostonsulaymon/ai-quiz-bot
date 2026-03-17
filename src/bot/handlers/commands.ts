@@ -12,7 +12,7 @@ import { registerGroupHandlers, startGroupQuiz, cancelGroupQuiz, stopGroupQuiz }
 import type { BotContext } from "../types.js";
 import { resetSession } from "../types.js";
 import { enterUploadFlow } from "./upload.handler.js";
-import { enterTestFlow } from "./test.handler.js";
+import { enterTestFlow, registerTestPollHandler } from "./test.handler.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import { TestSessionRepository } from "../../db/repositories/test-session.repository.js";
 import type { UserStats } from "../../db/repositories/test-session.repository.js";
@@ -604,5 +604,6 @@ export const registerCommandHandlers = async (bot: Bot<BotContext>): Promise<voi
   registerHistoryHandler(bot);
   registerLeaderboardHandler(bot);
   registerGroupHandlers(bot);
+  registerTestPollHandler(bot);
   registerSettingsHandler(bot);
 };

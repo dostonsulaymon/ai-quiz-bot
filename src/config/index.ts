@@ -88,7 +88,7 @@ export const config: Config = {
   OLLAMA_BASE_URL: getEnv("OLLAMA_BASE_URL", false),
   OLLAMA_MODEL: getEnv("OLLAMA_MODEL", false),
   SENTRY_DSN: getEnv("SENTRY_DSN", false),
-  HEALTH_CHECK_PORT: Number(process.env.HEALTH_CHECK_PORT) || 3000,
+  HEALTH_CHECK_PORT: Number(process.env.HEALTH_CHECK_PORT) || 4334,
   NODE_ENV: nodeEnv,
   MAX_QUESTIONS_PER_TEST: parseNumber("MAX_QUESTIONS_PER_TEST"),
   MAX_FILE_SIZE_MB: parseNumber("MAX_FILE_SIZE_MB"),

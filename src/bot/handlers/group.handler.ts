@@ -10,6 +10,7 @@ import type { Question } from "../../shared/types/index.js";
 import { t, type Language } from "../../shared/i18n/index.js";
 import { safeEditMessage, safeEditMessageViaApi } from "../utils/telegram.js";
 import { formatQuestionDisplay, formatOptionDisplay } from "../utils/format.js";
+import { activePollSessions } from "../types.js";
 import { ValidationError } from "../../shared/errors/ValidationError.js";
 import { logger } from "../../shared/logger.js";
 
@@ -57,6 +58,12 @@ const buildQuestionText = (question: Question, index: number, total: number, lan
   }
 
   return lines.join("\n");
+};
+
+const buildProgressBar = (current: number, total: number): string => {
+  const slots = 10;
+  const filled = Math.max(0, Math.min(slots, Math.round((current / total) * slots)));
+  return `${"█".repeat(filled)}${"░".repeat(slots - filled)}`;
 };
 
 const buildFullQuestionText = (
@@ -178,10 +185,58 @@ const sendGroupQuestionViaApi = async (
   const question = questions[idx]! as unknown as Question;
   const answeredCount = (session.answers as Array<{ questionId: string }>).filter((a) => a.questionId === question.id).length;
 
-  const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount);
-  const keyboard = buildQuestionKeyboard(String(session._id), question, idx, lang, answeredCount);
+  if (session.progressMessageId) {
+    await api.deleteMessage(chatId, session.progressMessageId).catch(() => undefined);
+    await groupSessionRepository.setProgressMessageId(session._id, null);
+  }
 
-  const msg = await api.sendMessage(chatId, text, { reply_markup: keyboard });
+  let msg;
+  const isNativePoll = question.type === "mcq" || question.type === "truefalse";
+
+  if (isNativePoll) {
+    const progressBar = buildProgressBar(idx + 1, questions.length);
+    const progressMsg = await api.sendMessage(chatId, `${progressBar} ${idx + 1}/${questions.length}`);
+    await groupSessionRepository.setProgressMessageId(session._id, progressMsg.message_id);
+
+    const pollOptions = question.type === "mcq" && question.options
+      ? [
+          { text: formatOptionDisplay(question.options.A).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.B).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.C).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.D).slice(0, 100) }
+        ]
+      : [{ text: "True" }, { text: "False" }];
+
+    let correctOptionId: number;
+    if (question.type === "mcq") {
+      correctOptionId = question.correctAnswer === "A" ? 0 : question.correctAnswer === "B" ? 1 : question.correctAnswer === "C" ? 2 : 3;
+    } else {
+      correctOptionId = question.correctAnswer === "True" ? 0 : 1;
+    }
+
+    const { display: questionDisplay } = formatQuestionDisplay(question.question);
+    const pollQuestion = questionDisplay.slice(0, 300);
+    const openPeriod = test.timeLimitSeconds > 0 ? Math.min(600, Math.max(5, test.timeLimitSeconds)) : undefined;
+
+    msg = await api.sendPoll(chatId, pollQuestion, pollOptions, {
+      type: "quiz",
+      correct_option_id: correctOptionId,
+      is_anonymous: false,
+      open_period: openPeriod
+    });
+
+    activePollSessions.set(msg.poll.id, {
+      mode: "group",
+      sessionId: String(session._id),
+      chatId,
+      questionIndex: idx
+    });
+  } else {
+    const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount);
+    const keyboard = buildQuestionKeyboard(String(session._id), question, idx, lang, answeredCount);
+    msg = await api.sendMessage(chatId, text, { reply_markup: keyboard });
+  }
+
   await groupSessionRepository.setQuestionMessageId(session._id, msg.message_id);
   await groupSessionRepository.setQuestionSentAt(session._id, new Date());
 
@@ -191,15 +246,17 @@ const sendGroupQuestionViaApi = async (
     cancelGroupTimer(chatId);
 
     const intervals: ReturnType<typeof setTimeout>[] = [];
-    const intervalCount = Math.floor(test.timeLimitSeconds / 5);
-    for (let i = 1; i < intervalCount; i++) {
-      const remaining = test.timeLimitSeconds - i * 5;
-      intervals.push(setTimeout(async () => {
-        const fresh = await groupSessionRepository.findActiveByChat(chatId);
-        if (!fresh || String(fresh._id) !== sessionId || fresh.currentQuestionIndex !== idx) return;
-        const freshCount = (fresh.answers as Array<{ questionId: string }>).filter((a) => a.questionId === question.id).length;
-        await safeEditMessageViaApi(api, chatId, messageId, buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, freshCount, remaining));
-      }, i * 5 * 1000));
+    if (!isNativePoll) {
+      const intervalCount = Math.floor(test.timeLimitSeconds / 5);
+      for (let i = 1; i < intervalCount; i++) {
+        const remaining = test.timeLimitSeconds - i * 5;
+        intervals.push(setTimeout(async () => {
+          const fresh = await groupSessionRepository.findActiveByChat(chatId);
+          if (!fresh || String(fresh._id) !== sessionId || fresh.currentQuestionIndex !== idx) return;
+          const freshCount = (fresh.answers as Array<{ questionId: string }>).filter((a) => a.questionId === question.id).length;
+          await safeEditMessageViaApi(api, chatId, messageId, buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, freshCount, remaining));
+        }, i * 5 * 1000));
+      }
     }
 
     const main = setTimeout(() => {
@@ -278,30 +335,81 @@ const sendGroupQuestion = async (
     (a) => a.questionId === question.id
   ).length;
 
-  const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount);
-  const keyboard = buildQuestionKeyboard(String(session._id), question, idx, lang, answeredCount);
+  const chatId = String(ctx.chat!.id);
+  const api = ctx.api;
 
-  const msg = await ctx.reply(text, { reply_markup: keyboard });
+  if (session.progressMessageId) {
+    await api.deleteMessage(chatId, session.progressMessageId).catch(() => undefined);
+    await groupSessionRepository.setProgressMessageId(session._id, null);
+  }
+
+  let msg;
+  const isNativePoll = question.type === "mcq" || question.type === "truefalse";
+
+  if (isNativePoll) {
+    const progressBar = buildProgressBar(idx + 1, questions.length);
+    const progressMsg = await api.sendMessage(chatId, `${progressBar} ${idx + 1}/${questions.length}`);
+    await groupSessionRepository.setProgressMessageId(session._id, progressMsg.message_id);
+
+    const pollOptions = question.type === "mcq" && question.options
+      ? [
+          { text: formatOptionDisplay(question.options.A).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.B).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.C).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.D).slice(0, 100) }
+        ]
+      : [{ text: "True" }, { text: "False" }];
+
+    let correctOptionId: number;
+    if (question.type === "mcq") {
+      correctOptionId = question.correctAnswer === "A" ? 0 : question.correctAnswer === "B" ? 1 : question.correctAnswer === "C" ? 2 : 3;
+    } else {
+      correctOptionId = question.correctAnswer === "True" ? 0 : 1;
+    }
+
+    const { display: questionDisplay } = formatQuestionDisplay(question.question);
+    const pollQuestion = questionDisplay.slice(0, 300);
+    const openPeriod = test.timeLimitSeconds > 0 ? Math.min(600, Math.max(5, test.timeLimitSeconds)) : undefined;
+
+    msg = await api.sendPoll(chatId, pollQuestion, pollOptions, {
+      type: "quiz",
+      correct_option_id: correctOptionId,
+      is_anonymous: false,
+      open_period: openPeriod
+    });
+
+    activePollSessions.set(msg.poll.id, {
+      mode: "group",
+      sessionId: String(session._id),
+      chatId,
+      questionIndex: idx
+    });
+  } else {
+    const text = buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, answeredCount);
+    const keyboard = buildQuestionKeyboard(String(session._id), question, idx, lang, answeredCount);
+    msg = await api.sendMessage(chatId, text, { reply_markup: keyboard });
+  }
+
   await groupSessionRepository.setQuestionMessageId(session._id, msg.message_id);
   await groupSessionRepository.setQuestionSentAt(session._id, new Date());
 
   if (test.timeLimitSeconds > 0) {
-    const chatId = String(ctx.chat!.id);
-    const api = ctx.api;
     const sessionId = String(session._id);
     const messageId = msg.message_id;
     cancelGroupTimer(chatId);
 
     const intervals: ReturnType<typeof setTimeout>[] = [];
-    const intervalCount = Math.floor(test.timeLimitSeconds / 5);
-    for (let i = 1; i < intervalCount; i++) {
-      const remaining = test.timeLimitSeconds - i * 5;
-      intervals.push(setTimeout(async () => {
-        const fresh = await groupSessionRepository.findActiveByChat(chatId);
-        if (!fresh || String(fresh._id) !== sessionId || fresh.currentQuestionIndex !== idx) return;
-        const freshCount = (fresh.answers as Array<{ questionId: string }>).filter((a) => a.questionId === question.id).length;
-        await safeEditMessageViaApi(api, chatId, messageId, buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, freshCount, remaining));
-      }, i * 5 * 1000));
+    if (!isNativePoll) {
+      const intervalCount = Math.floor(test.timeLimitSeconds / 5);
+      for (let i = 1; i < intervalCount; i++) {
+        const remaining = test.timeLimitSeconds - i * 5;
+        intervals.push(setTimeout(async () => {
+          const fresh = await groupSessionRepository.findActiveByChat(chatId);
+          if (!fresh || String(fresh._id) !== sessionId || fresh.currentQuestionIndex !== idx) return;
+          const freshCount = (fresh.answers as Array<{ questionId: string }>).filter((a) => a.questionId === question.id).length;
+          await safeEditMessageViaApi(api, chatId, messageId, buildFullQuestionText(question, idx, questions.length, lang, test.timeLimitSeconds, freshCount, remaining));
+        }, i * 5 * 1000));
+      }
     }
 
     const main = setTimeout(() => {
@@ -691,26 +799,73 @@ export const handleGroupTextAnswer = async (ctx: BotContext): Promise<void> => {
   }
 };
 
+export const processGroupChoiceAnswer = async (
+  ctx: BotContext,
+  pollSession: import("../types.js").ActivePollSession
+): Promise<void> => {
+  const pollAnswer = ctx.pollAnswer;
+  if (!pollAnswer) return;
+
+  const { sessionId, chatId, questionIndex } = pollSession;
+  const userId = String(pollAnswer.user.id);
+  const firstName = pollAnswer.user.first_name ?? "User";
+  const username = pollAnswer.user.username;
+
+  const session = await groupSessionRepository.findActiveByChat(chatId);
+  if (!session || String(session._id) !== sessionId || session.currentQuestionIndex !== questionIndex) {
+    return;
+  }
+
+  const test = await testRepository.findById(String(session.testId));
+  if (!test) return;
+
+  const question = test.questions[questionIndex];
+  if (!question || (question.type !== "mcq" && question.type !== "truefalse")) return;
+
+  const optionId = pollAnswer.option_ids[0];
+  let answer = "";
+  if (question.type === "mcq") {
+    answer = optionId === 0 ? "A" : optionId === 1 ? "B" : optionId === 2 ? "C" : optionId === 3 ? "D" : "";
+  } else {
+    answer = optionId === 0 ? "True" : "False";
+  }
+
+  const isCorrect = answer.toLowerCase() === question.correctAnswer.toLowerCase();
+
+  await groupSessionRepository.addAnswer(session._id, question.id, userId, firstName, answer, isCorrect, username);
+  logger.info("Group native poll answer submitted", { event: "group.poll_answer.submitted", userId, questionIndex, type: question.type, isCorrect });
+};
+
 export const registerGroupHandlers = (bot: Bot<BotContext>): void => {
-  bot.callbackQuery(new RegExp(`^${GROUP_ANSWER_PREFIX}`), async (ctx) => {
+  bot.callbackQuery(new RegExp(`^${GROUP_ANSWER_PREFIX}`), async (ctx: BotContext) => {
     await handleGroupAnswer(ctx);
   });
 
-  bot.callbackQuery(new RegExp(`^${GROUP_NEXT_PREFIX}`), async (ctx) => {
+  bot.callbackQuery(new RegExp(`^${GROUP_NEXT_PREFIX}`), async (ctx: BotContext) => {
     await handleGroupNext(ctx);
   });
 
-  bot.callbackQuery(new RegExp(`^${GROUP_AGAIN_PREFIX}`), async (ctx) => {
+  bot.callbackQuery(new RegExp(`^${GROUP_AGAIN_PREFIX}`), async (ctx: BotContext) => {
     const testId = ctx.callbackQuery.data.slice(GROUP_AGAIN_PREFIX.length);
     await ctx.answerCallbackQuery();
     await startGroupQuiz(ctx, testId);
   });
 
-  bot.on("message:text", async (ctx, next) => {
+  bot.on("message:text", async (ctx: BotContext, next: () => Promise<void>) => {
     const chatType = ctx.chat?.type;
     if (chatType === "group" || chatType === "supergroup") {
       await handleGroupTextAnswer(ctx);
     }
     await next();
+  });
+
+  bot.on("poll_answer", async (ctx: BotContext, next: () => Promise<void>) => {
+    const pollId = ctx.pollAnswer.poll_id;
+    const sessionMeta = activePollSessions.get(pollId);
+    if (sessionMeta?.mode === "group") {
+      await processGroupChoiceAnswer(ctx, sessionMeta);
+    } else {
+      await next();
+    }
   });
 };

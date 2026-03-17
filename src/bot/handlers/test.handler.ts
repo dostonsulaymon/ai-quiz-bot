@@ -18,6 +18,7 @@ import { RedisSessionStorage } from "../storage/redis-session.storage.js";
 import { config } from "../../config/index.js";
 import { safeEditMessageViaApi } from "../utils/telegram.js";
 import { formatQuestionDisplay, formatOptionDisplay } from "../utils/format.js";
+import { activePollSessions } from "../types.js";
 
 const ANSWER_CALLBACK_PREFIX = "test:answer:";
 const SELF_GRADE_CALLBACK_PREFIX = "test:self:";
@@ -169,32 +170,25 @@ const runAutoAdvance = async (params: AutoAdvanceParams): Promise<void> => {
   }
 
   // Not the last question — advance and send the next one
-  const nextQuestion = (session.testQuestions ?? [])[nextIndex] as Question | undefined;
-  if (!nextQuestion) {
-    session.currentQuestionIndex = nextIndex;
-    session.questionStartedAt = undefined;
-    session.testQuestionMessageId = undefined;
-    await storage.write(sessionKey, session);
-    return;
-  }
-
-  const nextText = formatQuestionText(nextQuestion, nextIndex, totalQuestions, lang, params.timeLimitSeconds);
-  const nextKeyboard: InlineKeyboard | undefined =
-    nextQuestion.type === "mcq"
-      ? buildMcqKeyboard()
-      : nextQuestion.type === "truefalse"
-        ? buildTrueFalseKeyboard(lang)
-        : undefined;
-
-  const nextMsg = await api.sendMessage(chatId, nextText, nextKeyboard ? { reply_markup: nextKeyboard } : {});
-
   session.currentQuestionIndex = nextIndex;
-  session.testQuestionMessageId = nextMsg.message_id;
-  session.questionStartedAt = Date.now();
-  session.testSubState = "answering";
+  session.questionStartedAt = undefined;
+  session.testQuestionMessageId = undefined;
+  session.testPollId = undefined;
   await storage.write(sessionKey, session);
 
-  scheduleAutoAdvance({ ...params, messageId: nextMsg.message_id, question: nextQuestion, questionIndex: nextIndex });
+  // Set up a mock context for sendCurrentQuestion
+  const mockCtx = {
+    api,
+    redis,
+    chat: { id: chatId, type: "private" },
+    from: { id: parseInt(sessionKey.split(":")[0]) },
+    session,
+    lang: () => lang,
+    reply: async (text: string, kwargs?: any) => api.sendMessage(chatId, text, kwargs)
+  } as unknown as BotContext;
+
+  await sendCurrentQuestion(mockCtx);
+  await storage.write(sessionKey, session);
 };
 
 // ---------------------------------------------------------------------------
@@ -448,13 +442,7 @@ const sendCurrentQuestion = async (ctx: BotContext): Promise<void> => {
   }
 
   const question = questions[index]!;
-  const replyMarkup =
-    question.type === "mcq"
-      ? buildMcqKeyboard()
-      : question.type === "truefalse"
-        ? buildTrueFalseKeyboard(lang)
-        : undefined;
-
+  
   logger.info("Test scene entered", { event: "test.scene.enter", userId: ctx.from?.id, testId: ctx.session.activeTestId, questionIndex: index });
 
   if (index === 0 && !ctx.session.testStartedAt) {
@@ -462,24 +450,82 @@ const sendCurrentQuestion = async (ctx: BotContext): Promise<void> => {
   }
 
   const timeLimitSeconds = ctx.session.timeLimitSeconds ?? 0;
-  const message = await ctx.reply(formatQuestionText(question, index, questions.length, lang, timeLimitSeconds), { reply_markup: replyMarkup });
-  ctx.session.testQuestionMessageId = message.message_id;
-  ctx.session.questionStartedAt = Date.now();
-  ctx.session.testSubState = "answering";
+  
+  if (ctx.session.testProgressMessageId && ctx.chat) {
+    await ctx.api.deleteMessage(ctx.chat.id, ctx.session.testProgressMessageId).catch(() => undefined);
+    ctx.session.testProgressMessageId = undefined;
+  }
 
-  if (timeLimitSeconds > 0 && ctx.chat && ctx.from) {
-    scheduleAutoAdvance({
-      api: ctx.api,
-      redis: ctx.redis,
-      chatId: ctx.chat.id,
-      sessionKey: `${ctx.from.id}:${ctx.chat.id}`,
-      messageId: message.message_id,
-      question,
-      questionIndex: index,
-      totalQuestions: questions.length,
-      lang,
-      timeLimitSeconds
+  const isNativePoll = question.type === "mcq" || question.type === "truefalse";
+
+  if (isNativePoll && ctx.chat) {
+    const progressBar = buildProgressBar(index + 1, questions.length);
+    const progressMsg = await ctx.reply(`${progressBar} ${index + 1}/${questions.length}`);
+    ctx.session.testProgressMessageId = progressMsg.message_id;
+
+    const pollOptions = question.type === "mcq" && question.options
+      ? [
+          { text: formatOptionDisplay(question.options.A).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.B).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.C).slice(0, 100) },
+          { text: formatOptionDisplay(question.options.D).slice(0, 100) }
+        ]
+      : [{ text: "True" }, { text: "False" }];
+
+    let correctOptionId: number;
+    if (question.type === "mcq") {
+      correctOptionId = question.correctAnswer === "A" ? 0 : question.correctAnswer === "B" ? 1 : question.correctAnswer === "C" ? 2 : 3;
+    } else {
+      correctOptionId = question.correctAnswer === "True" ? 0 : 1;
+    }
+
+    const { display: questionDisplay } = formatQuestionDisplay(question.question);
+    const pollQuestion = questionDisplay.slice(0, 300);
+
+    const openPeriod = timeLimitSeconds > 0 ? Math.min(600, Math.max(5, timeLimitSeconds)) : undefined;
+
+    const msg = await ctx.api.sendPoll(ctx.chat.id, pollQuestion, pollOptions, {
+      type: "quiz",
+      correct_option_id: correctOptionId,
+      is_anonymous: false,
+      open_period: openPeriod,
+      explanation: question.explanation ? question.explanation.slice(0, 200) : undefined
     });
+
+    ctx.session.testQuestionMessageId = msg.message_id;
+    ctx.session.testPollId = msg.poll.id;
+    ctx.session.questionStartedAt = Date.now();
+    ctx.session.testSubState = "answering";
+    
+    activePollSessions.set(msg.poll.id, {
+      mode: "private",
+      sessionId: ctx.session.sessionId!,
+      chatId: String(ctx.chat.id),
+      questionIndex: index
+    });
+
+  } else {
+    const replyMarkup = undefined;
+    
+    const message = await ctx.reply(formatQuestionText(question, index, questions.length, lang, timeLimitSeconds), { reply_markup: replyMarkup });
+    ctx.session.testQuestionMessageId = message.message_id;
+    ctx.session.questionStartedAt = Date.now();
+    ctx.session.testSubState = "answering";
+
+    if (timeLimitSeconds > 0 && ctx.chat && ctx.from) {
+      scheduleAutoAdvance({
+        api: ctx.api,
+        redis: ctx.redis,
+        chatId: ctx.chat.id,
+        sessionKey: `${ctx.from.id}:${ctx.chat.id}`,
+        messageId: message.message_id,
+        question,
+        questionIndex: index,
+        totalQuestions: questions.length,
+        lang,
+        timeLimitSeconds
+      });
+    }
   }
 };
 
@@ -1018,4 +1064,83 @@ const buildAnswerReviewPage = async (
   kb.row().text(t(lang, "test.review.btn.back"), REVIEW_BACK_CALLBACK);
 
   return { text: lines.join("\n"), keyboard: kb };
+};
+
+// ---------------------------------------------------------------------------
+// Native Poll Answer Handlers
+// ---------------------------------------------------------------------------
+
+export const processPrivateChoiceAnswer = async (
+  ctx: BotContext,
+  pollSession: import("../types.js").ActivePollSession
+): Promise<void> => {
+  const pollAnswer = ctx.pollAnswer;
+  if (!pollAnswer) return;
+
+  const { sessionId, chatId, questionIndex } = pollSession;
+  const userId = pollAnswer.user.id;
+  const storage = new RedisSessionStorage<BotSession>(ctx.redis, config.SESSION_TTL_SECONDS);
+  const sessionKey = `${userId}:${chatId}`;
+  const session = await storage.read(sessionKey);
+  
+  if (!session || session.sessionId !== sessionId) return;
+
+  const activeTestId = session.activeTestId;
+  if (!activeTestId) return;
+
+  const test = await testRepository.findById(activeTestId);
+  if (!test) return;
+
+  const question = test.questions[questionIndex] as Question | undefined;
+  if (!question || (question.type !== "mcq" && question.type !== "truefalse")) return;
+
+  const optionId = pollAnswer.option_ids[0];
+  let userAnswer = "";
+  if (question.type === "mcq") {
+    userAnswer = optionId === 0 ? "A" : optionId === 1 ? "B" : optionId === 2 ? "C" : optionId === 3 ? "D" : "";
+  } else {
+    userAnswer = optionId === 0 ? "True" : "False";
+  }
+
+  const isCorrect = userAnswer === question.correctAnswer;
+
+  await testSessionRepository.updateAnswer(sessionId, {
+    questionId: question.id,
+    userAnswer,
+    isCorrect
+  } as QuestionAnswer);
+
+  logger.info("Test native poll answer submitted", { event: "test.poll_answer.submitted", userId, questionIndex, type: question.type, isCorrect });
+
+  if (isCorrect) {
+    session.testCorrectCount = (session.testCorrectCount ?? 0) + 1;
+  }
+
+  session.currentQuestionIndex = questionIndex + 1;
+  session.questionStartedAt = undefined;
+  session.testQuestionMessageId = undefined;
+  session.testPollId = undefined;
+
+  activePollSessions.delete(pollAnswer.poll_id);
+
+  // Set up a mock context for sendCurrentQuestion
+  Object.defineProperty(ctx, "chat", { get: () => ({ id: Number(chatId), type: "private", first_name: pollAnswer.user.first_name }) });
+  Object.defineProperty(ctx, "from", { get: () => pollAnswer.user });
+  Object.defineProperty(ctx, "session", { get: () => session, set: (v) => Object.assign(session, v) });
+  
+  await sendCurrentQuestion(ctx);
+  
+  await storage.write(sessionKey, session);
+};
+
+export const registerTestPollHandler = (bot: import("grammy").Bot<BotContext>): void => {
+  bot.on("poll_answer", async (ctx: BotContext, next: () => Promise<void>) => {
+    const pollId = ctx.pollAnswer.poll_id;
+    const sessionMeta = activePollSessions.get(pollId);
+    if (sessionMeta?.mode === "private") {
+      await processPrivateChoiceAnswer(ctx, sessionMeta);
+    } else {
+      await next();
+    }
+  });
 };
