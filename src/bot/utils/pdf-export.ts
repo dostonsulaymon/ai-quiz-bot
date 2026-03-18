@@ -6,16 +6,29 @@ import ArabicReshaper from "arabic-reshaper";
 import bidiFactory from "bidi-js";
 import type { TestDocument } from "../../db/models/test.model.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
+import { logger } from "../../shared/logger.js";
 
 const bidi = bidiFactory();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const NOTO_ARABIC_PATH = path.resolve(__dirname, "../../assets/fonts/NotoSansArabic-Regular.ttf");
-const NOTO_LATIN_PATH = path.resolve(__dirname, "../../assets/fonts/NotoSans-Regular.ttf");
+const AMIRI_REGULAR_PATH = path.resolve(__dirname, "../../assets/fonts/Amiri-Regular.ttf");
+const AMIRI_BOLD_PATH = path.resolve(__dirname, "../../assets/fonts/Amiri-Bold.ttf");
+const CAIRO_REGULAR_PATH = path.resolve(__dirname, "../../assets/fonts/Cairo-Regular.ttf");
+const CAIRO_BOLD_PATH = path.resolve(__dirname, "../../assets/fonts/Cairo-Bold.ttf");
+const NOTO_SANS_ARABIC_REGULAR_PATH = path.resolve(__dirname, "../../assets/fonts/NotoSansArabic-Regular.ttf");
+const NOTO_NASKH_ARABIC_REGULAR_PATH = path.resolve(__dirname, "../../assets/fonts/NotoNaskhArabic-Regular.ttf");
+const NOTO_SANS_REGULAR_PATH = path.resolve(__dirname, "../../assets/fonts/NotoSans-Regular.ttf");
 
 const hasArabic = (text: string): boolean => /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(text);
+
+const resolveFirstExistingFont = (candidates: string[]): string | null => {
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+};
 
 /**
  * Reshapes Arabic text and applies the Unicode Bidirectional Algorithm
@@ -55,30 +68,34 @@ const segmentText = (text: string): { text: string; isArabic: boolean }[] => {
   return segments || [{ text, isArabic: false }];
 };
 
+const isArabicDominant = (text: string): boolean => {
+  const arabicChars = (text.match(/[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g) ?? []).length;
+  const latinChars = (text.match(/[A-Za-z]/g) ?? []).length;
+  return arabicChars > latinChars;
+};
+
 /**
- * Helper to draw text using the appropriate font for each character.
+ * Draw a full line in a single PDFKit call.
+ * Arabic runs are reshaped + bidi-processed once for the whole line.
  */
 const drawMixedText = (
   doc: PDFKit.PDFDocument,
   text: string,
-  options: any = {},
+  options: Record<string, unknown> = {},
   isBold: boolean = false
 ) => {
-  const segments = segmentText(text);
-  
-  segments.forEach((seg, i) => {
-    const isLast = i === segments.length - 1;
-    const fontName = seg.isArabic ? "ArabicFont" : "LatinFont";
-    
-    // PDFKit font switching
-    doc.font(fontName);
-    
-    const processedText = seg.isArabic ? fixArabicText(seg.text) : seg.text;
-    
-    doc.text(processedText, {
-      ...options,
-      continued: !isLast
-    });
+  const rawText = (text ?? "").replace(/[\u2066\u2067\u2068\u2069\u200E\u200F]/g, "");
+  const processedText = hasArabic(rawText) ? fixArabicText(rawText) : rawText;
+
+  const requestedAlign = options.align as "left" | "center" | "right" | "justify" | undefined;
+  const resolvedAlign = hasArabic(rawText) && isArabicDominant(rawText)
+    ? "right"
+    : requestedAlign;
+
+  doc.font(isBold ? "CairoBold" : "CairoRegular");
+  doc.text(processedText, {
+    ...options,
+    align: resolvedAlign
   });
 };
 
@@ -111,18 +128,50 @@ export async function generateTestPDF(
     doc.on("end", () => resolve(Buffer.concat(chunks)));
     doc.on("error", reject);
 
-    // Register both fonts
-    if (existsSync(NOTO_LATIN_PATH)) {
-      doc.registerFont("LatinFont", NOTO_LATIN_PATH);
-    } else {
-      doc.registerFont("LatinFont", "Helvetica"); // Fallback
+    const _ = collectTextForFontCheck(test, includeAnswers);
+    void _;
+
+    const regularFontPath = resolveFirstExistingFont([
+      AMIRI_REGULAR_PATH,
+      NOTO_NASKH_ARABIC_REGULAR_PATH,
+      NOTO_SANS_ARABIC_REGULAR_PATH,
+      CAIRO_REGULAR_PATH,
+      NOTO_SANS_REGULAR_PATH
+    ]);
+    const boldFontPath = resolveFirstExistingFont([
+      AMIRI_BOLD_PATH,
+      AMIRI_REGULAR_PATH,
+      NOTO_NASKH_ARABIC_REGULAR_PATH,
+      NOTO_SANS_ARABIC_REGULAR_PATH,
+      CAIRO_BOLD_PATH,
+      CAIRO_REGULAR_PATH,
+      NOTO_SANS_REGULAR_PATH
+    ]);
+
+    if (!regularFontPath || !boldFontPath) {
+      throw new Error(
+        [
+          "Missing Arabic-capable font files for PDF export.",
+          "Provide Cairo-Regular.ttf/Cairo-Bold.ttf in src/assets/fonts/",
+          `Checked regular candidates: ${[AMIRI_REGULAR_PATH, NOTO_NASKH_ARABIC_REGULAR_PATH, NOTO_SANS_ARABIC_REGULAR_PATH, CAIRO_REGULAR_PATH, NOTO_SANS_REGULAR_PATH].join(", ")}`,
+          `Checked bold candidates: ${[AMIRI_BOLD_PATH, AMIRI_REGULAR_PATH, NOTO_NASKH_ARABIC_REGULAR_PATH, NOTO_SANS_ARABIC_REGULAR_PATH, CAIRO_BOLD_PATH, CAIRO_REGULAR_PATH, NOTO_SANS_REGULAR_PATH].join(", ")}`
+        ].join(" ")
+      );
     }
 
-    if (existsSync(NOTO_ARABIC_PATH)) {
-      doc.registerFont("ArabicFont", NOTO_ARABIC_PATH);
-    } else {
-      doc.registerFont("ArabicFont", "Helvetica"); // Fallback
-    }
+    logger.info("PDF export font selection", {
+      event: "pdf.export.fonts.selected",
+      regularFontPath,
+      boldFontPath,
+      usingCairoRegular: regularFontPath === CAIRO_REGULAR_PATH,
+      usingCairoBold: boldFontPath === CAIRO_BOLD_PATH
+    });
+
+    // Validate selected font files are readable before registering.
+    readFileSync(regularFontPath);
+    readFileSync(boldFontPath);
+    doc.registerFont("CairoRegular", regularFontPath);
+    doc.registerFont("CairoBold", boldFontPath);
 
     // Title
     const titleText = test.title?.trim() || t(lang, "common.untitledTest");
@@ -131,7 +180,9 @@ export async function generateTestPDF(
     doc.moveDown();
 
     // Subtitle
-    const subtitle = `${t(lang, "mytests.preview.questions", { n: test.questions.length })} • ${formatQuestionTypes(test.questions.map((q) => q.type), lang)}`;
+    const left = t(lang, "mytests.preview.questions", { n: test.questions.length });
+    const right = formatQuestionTypes(test.questions.map((q) => q.type), lang);
+    const subtitle = `${left} • ${right}`;
     doc.fontSize(10).fillColor("black");
     drawMixedText(doc, subtitle, { align: "center" });
     doc.moveDown(2);
@@ -146,20 +197,20 @@ export async function generateTestPDF(
           const option = question.options?.[letter];
           if (option) {
             doc.fontSize(11).fillColor("black");
-            drawMixedText(doc, `   ${letter}) ${option}`);
+            drawMixedText(doc, `${letter}) ${option}`, { indent: 20 });
           }
         });
       } else if (question.type === "truefalse") {
         doc.fontSize(11).fillColor("black");
-        drawMixedText(doc, "   A) True    B) False");
+        drawMixedText(doc, "A) True    B) False", { indent: 20 });
       } else {
         doc.fontSize(11).fillColor("black");
-        drawMixedText(doc, `   ${t(lang, "mytests.export.answerLine")}`);
+        drawMixedText(doc, `${t(lang, "mytests.export.answerLine")}`, { indent: 20 });
       }
 
       if (includeAnswers) {
         doc.fontSize(10).fillColor("green");
-        drawMixedText(doc, `   ✓ ${question.correctAnswer}`);
+        drawMixedText(doc, `✓ ${question.correctAnswer}`, { indent: 20 });
         doc.fillColor("black");
       }
 

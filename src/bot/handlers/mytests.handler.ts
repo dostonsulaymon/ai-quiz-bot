@@ -8,7 +8,7 @@ import { enterTestFlow, LEADERBOARD_CALLBACK_PREFIX } from "./test.handler.js";
 import { enterEditFlow } from "./edit.handler.js";
 import { t, formatQuestionTypes, type Language } from "../../shared/i18n/index.js";
 import { safeEditMessage } from "../utils/telegram.js";
-import { generateTestPDF } from "../utils/pdf-export.js";
+import { generateTestPDF } from "../utils/pdf-export.puppeteer.js";
 import { NAV_NEWTEST_CALLBACK } from "./commands.js";
 
 const MYTESTS_PAGE_SIZE = 1;
