@@ -17,8 +17,8 @@
     "bot",
     "typescript"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "Doston Sulaymon",
+  "license": "MIT",
   "dependencies": {
     "@sentry/node": "^10.43.0",
     "arabic-reshaper": "^1.1.0",
